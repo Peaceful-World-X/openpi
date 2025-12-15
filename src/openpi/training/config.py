@@ -903,7 +903,7 @@ _CONFIGS = [
             adapt_to_pi=True, # Aloha/Songling
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
-        checkpoint_base_dir = "/shared_disk/users/yang.wang/checkpoint"
+        checkpoint_base_dir = "/shared_disk/users/yang.wang/checkpoint",
         num_train_steps=40_000,
         batch_size=128,
         num_workers=64,
