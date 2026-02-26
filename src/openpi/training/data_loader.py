@@ -3,7 +3,7 @@ import logging
 import multiprocessing
 import os
 import typing
-from typing import Literal, Protocol, SupportsIndex, TypeVar
+from typing import Literal, Protocol, SupportsIndex, TypeVar, Union
 
 import jax
 import jax.numpy as jnp
@@ -13,30 +13,70 @@ import torch
 
 import openpi.models.model as _model
 import openpi.training.config as _config
-from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.droid_rlds_dataset import DroidRldsDataset, DroidRldsNewDataset
+from openpi.training.truth_rlds_dataset import TruthRldsDataset, TruthRldsDatasetCartesian, TruthRldsDatasetDualCartesian, TruthRldsDatasetJointWithoutGripper
+from openpi.training.franka_rlds_dataset import FrankaRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+# Type alias for all supported RLDS dataset types
+RLDSDatasetType = Union[
+    DroidRldsDataset,
+    DroidRldsNewDataset,
+    TruthRldsDataset,
+    TruthRldsDatasetCartesian,
+    TruthRldsDatasetDualCartesian,
+    TruthRldsDatasetJointWithoutGripper,
+    FrankaRldsDataset,
+]
+
+# Mapping from config name to RLDS dataset class
+CONFIG_NAME: dict[str, type[RLDSDatasetType]] = {
+    # Truth RLDS Dataset (Joint space)
+    "pi0_fast_truth_finetune": TruthRldsDataset,
+    # Truth RLDS Dataset (Cartesian space)
+    "pi05_truth_finetune_cartesian": TruthRldsDatasetCartesian,
+    "pi05_truth_finetune_cartesian_cloth": TruthRldsDatasetCartesian,
+    "pi05_truth_finetune_cartesian_wood": TruthRldsDatasetCartesian,
+    "pi05_truth_finetune_cartesian_cloth_downsampled": TruthRldsDatasetCartesian,
+    "pi05_truth_finetune_cartesian_cloth_new": TruthRldsDatasetCartesian,
+    "pi05_truth_finetune_cartesian_catch_wood_and_move": TruthRldsDatasetCartesian,
+    # Truth RLDS Dataset (Dual Cartesian space)
+    "pi05_truth_finetune_darmigo3_004": TruthRldsDatasetDualCartesian,
+    # Truth RLDS Dataset (Joint space without gripper)
+    "pi05_cytoderm10_joint_arm_move": TruthRldsDatasetJointWithoutGripper,
+    "pi05_cytoderm11_joint_arm_move": TruthRldsDatasetJointWithoutGripper,
+    # DROID RLDS Dataset
+    "pi0_fast_droid_finetune": DroidRldsDataset,
+    "pi0_fast_droid_finetune_new": DroidRldsNewDataset,
+    # Franka RLDS Dataset
+    "pi05_franka_finetune_joint_wood": FrankaRldsDataset,
+}
 
 
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        raise NotImplementedError("Subclasses of Dataset should implement __getitem__.")
+        raise NotImplementedError(
+            "Subclasses of Dataset should implement __getitem__.")
 
     def __len__(self) -> int:
-        raise NotImplementedError("Subclasses of Dataset should implement __len__.")
+        raise NotImplementedError(
+            "Subclasses of Dataset should implement __len__.")
 
 
 class IterableDataset(Protocol[T_co]):
     """Interface for an iterable dataset."""
 
     def __iter__(self) -> Iterator[T_co]:
-        raise NotImplementedError("Subclasses of IterableDataset should implement __iter__.")
+        raise NotImplementedError(
+            "Subclasses of IterableDataset should implement __iter__.")
 
     def __len__(self) -> int:
-        raise NotImplementedError("Subclasses of Dataset should implement __len__.")
+        raise NotImplementedError(
+            "Subclasses of Dataset should implement __len__.")
 
 
 class DataLoader(Protocol[T_co]):
@@ -44,10 +84,12 @@ class DataLoader(Protocol[T_co]):
 
     def data_config(self) -> _config.DataConfig:
         """Get the data config for this data loader."""
-        raise NotImplementedError("Subclasses of DataLoader should implement data_config.")
+        raise NotImplementedError(
+            "Subclasses of DataLoader should implement data_config.")
 
     def __iter__(self) -> Iterator[T_co]:
-        raise NotImplementedError("Subclasses of DataLoader should implement __iter__.")
+        raise NotImplementedError(
+            "Subclasses of DataLoader should implement __iter__.")
 
 
 class TransformedDataset(Dataset[T_co]):
@@ -146,27 +188,10 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(
+            dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
-
-
-def create_rlds_dataset(
-    data_config: _config.DataConfig,
-    action_horizon: int,
-    batch_size: int,
-    *,
-    shuffle: bool = False,
-) -> Dataset:
-    # At the moment, we only support DROID for RLDS datasets.
-    return DroidRldsDataset(
-        data_dir=data_config.rlds_data_dir,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        action_chunk_size=action_horizon,
-        action_space=data_config.action_space,
-        datasets=data_config.datasets,
-    )
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
@@ -185,7 +210,8 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            _transforms.Normalize(
+                norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
     )
@@ -213,7 +239,8 @@ def transform_iterable_dataset(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            _transforms.Normalize(
+                norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
         is_batched=is_batched,
@@ -244,7 +271,8 @@ def create_data_loader(
 
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
-            data_config,
+            config_name=config.name,
+            data_config=data_config,
             action_horizon=config.model.action_horizon,
             batch_size=config.batch_size,
             sharding=sharding,
@@ -253,6 +281,7 @@ def create_data_loader(
             skip_norm_stats=skip_norm_stats,
             framework=framework,
         )
+
     return create_torch_data_loader(
         data_config,
         model_config=config.model,
@@ -300,7 +329,8 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = transform_dataset(
+        dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -326,7 +356,8 @@ def create_torch_data_loader(
         dataset,
         local_batch_size=local_batch_size,
         sharding=None if framework == "pytorch" else sharding,
-        shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+        # Don't shuffle if using sampler
+        shuffle=(sampler is None and shuffle),
         sampler=sampler,
         num_batches=num_batches,
         num_workers=num_workers,
@@ -338,6 +369,7 @@ def create_torch_data_loader(
 
 
 def create_rlds_data_loader(
+    config_name: str,
     data_config: _config.DataConfig,
     action_horizon: int,
     batch_size: int,
@@ -353,6 +385,7 @@ def create_rlds_data_loader(
     Note: This data loader requires some extra dependencies -- see examples/droid/README_train.md
 
     Args:
+        config_name: The config name to determine which dataset class to use.
         data_config: The data configuration.
         action_horizon: The action horizon.
         batch_size: The batch size.
@@ -363,12 +396,53 @@ def create_rlds_data_loader(
         num_batches: Determines the number of batches to return. If the number exceeds the
             number of batches in the dataset, the data loader will loop over the dataset.
             If not provided, will iterate over the dataset indefinitely.
+        framework: The framework to use ("jax" or "pytorch").
     """
     if framework == "pytorch":
-        raise NotImplementedError("PyTorch RLDS data loader is not supported yet")
-    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
-    dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
+        raise NotImplementedError(
+            "PyTorch RLDS data loader is not supported yet")
 
+    dataset_class = CONFIG_NAME[config_name]
+
+    # 准备基础参数
+    dataset_kwargs = {
+        "repo_id": data_config.repo_id,
+        "data_dir": data_config.rlds_data_dir,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "action_chunk_size": action_horizon,
+        "action_space": data_config.action_space,
+        "filter_dict_path": data_config.filter_dict_path,
+    }
+
+    # 对于支持 downsampled_and_repeated 的数据集类型，添加该参数
+    if dataset_class in (TruthRldsDatasetCartesian, TruthRldsDatasetDualCartesian):
+        dataset_kwargs["downsampled_and_repeated"] = data_config.downsampled_and_repeated
+        if dataset_class == TruthRldsDatasetCartesian:
+            print(
+                f"data_config.downsampled_and_repeated: {data_config.downsampled_and_repeated}")
+
+    # 打印调试信息
+    dataset_type_names = {
+        TruthRldsDataset: "Truth RLDS",
+        TruthRldsDatasetCartesian: "Truth RLDS Cartesian",
+        TruthRldsDatasetJointWithoutGripper: "Truth RLDS Joint Without Gripper",
+        TruthRldsDatasetDualCartesian: "Truth RLDS Dual Cartesian",
+        DroidRldsDataset: "DROID RLDS",
+        DroidRldsNewDataset: "DROID RLDS New",
+        FrankaRldsDataset: "Franka RLDS",
+    }
+    print(
+        f"----------------------------create_{dataset_type_names.get(dataset_class, 'RLDS')}_data_loader----------------------------------")
+
+    # 创建数据集
+    dataset = dataset_class(**dataset_kwargs)
+
+    # 应用数据转换
+    dataset = transform_iterable_dataset(
+        dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
+
+    # 创建数据加载器
     data_loader = RLDSDataLoader(
         dataset,
         sharding=sharding,
@@ -410,10 +484,12 @@ class TorchDataLoader:
             seed: The seed to use for shuffling the data.
         """
         if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+            raise NotImplementedError(
+                "Data loading with multiple processes is not supported.")
 
         if len(dataset) < local_batch_size:
-            raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+            raise ValueError(
+                f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -434,7 +510,8 @@ class TorchDataLoader:
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+            # Don't shuffle if using sampler
+            shuffle=(sampler is None and shuffle),
             sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
@@ -459,7 +536,8 @@ class TorchDataLoader:
                 try:
                     batch = next(data_iter)
                 except StopIteration:
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
+                    # We've exhausted the dataset. Create a new iterator and start over.
+                    break
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
@@ -484,14 +562,14 @@ def _worker_init_fn(worker_id: int) -> None:
 
 
 class RLDSDataLoader:
-    """Shallow wrapper around the DROID data loader to make it compatible with openpi.
+    """Shallow wrapper around the RLDS data loader to make it compatible with openpi.
 
-    All batching already happens in the DROID dataset, so we don't need to do anything here.
+    All batching already happens in the RLDS dataset, so we don't need to do anything here.
     """
 
     def __init__(
         self,
-        dataset: DroidRldsDataset,
+        dataset: RLDSDatasetType,
         *,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
@@ -500,7 +578,8 @@ class RLDSDataLoader:
         self._num_batches = num_batches
 
         if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+            raise NotImplementedError(
+                "Data loading with multiple processes is not supported.")
 
         if sharding is None:
             # Use data parallel sharding by default.
@@ -514,6 +593,7 @@ class RLDSDataLoader:
 
     def __iter__(self):
         num_items = 0
+        warned_remainder = False
         while True:
             data_iter = iter(self._dataset)
             while True:
@@ -522,8 +602,48 @@ class RLDSDataLoader:
                 try:
                     batch = next(data_iter)
                 except StopIteration:
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
+                    # We've exhausted the dataset. Create a new iterator and start over.
+                    break
                 num_items += 1
+                # JAX data-parallel sharding over axis "B" requires the global batch dimension
+                # to be divisible by the number of devices. RLDS tf.data pipelines may yield
+                # a smaller final batch (no drop_remainder), which would crash here.
+                # We truncate to the largest divisible prefix (or skip if too small).
+                n_devices = jax.device_count()
+                batch0 = None
+                for leaf in jax.tree.leaves(batch):
+                    if isinstance(leaf, np.ndarray) and leaf.ndim > 0:
+                        batch0 = leaf.shape[0]
+                        break
+
+                if batch0 is not None and batch0 % n_devices != 0:
+                    new0 = (batch0 // n_devices) * n_devices
+                    if new0 == 0:
+                        if not warned_remainder:
+                            logging.warning(
+                                "Skipping RLDS batch with size %d which is smaller than device_count=%d.",
+                                batch0,
+                                n_devices,
+                            )
+                            warned_remainder = True
+                        continue
+
+                    if not warned_remainder:
+                        logging.warning(
+                            "Truncating RLDS batch from %d to %d to be divisible by device_count=%d.",
+                            batch0,
+                            new0,
+                            n_devices,
+                        )
+                        warned_remainder = True
+
+                    batch = jax.tree.map(
+                        lambda x: x[:new0]
+                        if isinstance(x, np.ndarray) and x.ndim > 0 and x.shape[0] == batch0
+                        else x,
+                        batch,
+                    )
+
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 

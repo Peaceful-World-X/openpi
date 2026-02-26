@@ -1,7 +1,13 @@
 # Pi0.5
 
+## 本地-H100
+### 初始化
+
+### 推理
+
+
 ## 本地-RTX4060
-### 1.1 初始化
+### 初始化
 ```bash
 # 初始化容器
 docker run -it \
@@ -17,32 +23,27 @@ docker run -it \
   -v /home/cyto/results:/home/cyto/results \
   openpi:v3.0
 
-# 管理员权限进入容器
-docker run -it --name openpi_ymy_new openpi:v3.0 /bin/bash
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 ```
 
-### 1.2 本地推理
+### 推理
 ```bash
 # 进入环境
-docker exec -u 0 -it openpi_ymy_new /bin/bash
+docker exec -u 0 -it openpi_xwy /bin/bash
 cd /home/cyto/code/openpi
+
 # 推理
-# 不预占整块，按需分配，避免一开始就占满导致推理时不够
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-# 允许 JAX 使用 100% 显存（在无其他进程占用的前提下）
-export XLA_PYTHON_CLIENT_MEM_FRACTION=1
-# 使用平台分配器，有时能提高可用显存
-export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+export XLA_PYTHON_CLIENT_PREALLOCATE=false        # 不预占整块，按需分配，避免一开始就占满导致推理时不够
+export XLA_PYTHON_CLIENT_MEM_FRACTION=1           # 允许 JAX 使用 100% 显存（在无其他进程占用的前提下）
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform       # 使用平台分配器，有时能提高可用显存
 uv run scripts/serve_policy.py policy:checkpoint \
   --policy.config=pi05_cytoderm11_joint_arm_move \
   --policy.dir=/home/cyto/results/openpi/checkpoints/pi05_cytoderm11_joint_arm_move/my_experiment_cytoderm11_joint_007/40000
-  
 ```
 
 ## 云端-A800
 
-### 1.2 云端推理
+### 推理
 ```bash
 # 进入环境
 docker exec -u 0 -it openpi_ymy_new /bin/bash

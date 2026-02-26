@@ -1,0 +1,51 @@
+# Run with:
+# docker compose -f scripts/docker/compose_plus.yml up --build
+services:
+  openpi_server:
+    container_name: openpi_ymy_new
+    image: openpi:v3.0
+    build:
+      context: ../..
+      dockerfile: scripts/docker/serve_policy.Dockerfile
+    init: true
+    tty: true
+    # 恢复host网络模式以解决网络连接问题
+    # network_mode: host
+    ports:
+      - "8000:8000"
+    # 增加共享内存大小，解决NCCL共享内存不足问题
+    shm_size: 2gb
+    # memory_reservation: 224g
+    # pids_limit: 4096
+    # GPU配置和内存限制 - 使用新版本语法
+    deploy:
+      resources:
+        limits:
+          memory: 256g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Populate configured openpi data home to /openpi_assets inside the container.
+    # Populate aws credential inside the container.
+    volumes:
+      # 添加项目代码挂载到/app目录（容器的工作目录）
+      - ../..:/app:rw
+      - /home/datasets:/home/datasets:rw
+      - /home/datasets_v2:/home/datasets_v2:rw
+      - /home/models:/home/models:rw
+      - /home/yaomingyuan/Programs:/home/yaomingyuan/Programs:rw
+      # - /home/yaomingyuan/.cache:/home/yaomingyuan/.cache:rw
+      - /home/models/openpi/.cache:/root/.cache:rw
+      - /home/pub_envs:/home/pub_envs:rw
+      - /home/results:/home/results:rw
+    environment:
+      - SERVER_ARGS
+      # - OPENPI_DATA_HOME=/openpi_assets
+      - IS_DOCKER=true
+      - SKIP_MODEL_DOWNLOAD=true
+    # 添加命令覆盖，启动bash而不是serve_policy
+    # command: ["/bin/bash", "-c", "echo 'Container started. Use docker exec to enter.' && tail -f /dev/null"]
+
+    # GPU配置已在上方定义

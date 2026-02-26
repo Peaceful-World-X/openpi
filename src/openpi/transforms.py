@@ -135,7 +135,8 @@ class Normalize(DataTransformFn):
         )
 
     def _normalize(self, x, stats: NormStats):
-        mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
+        mean, std = stats.mean[..., : x.shape[-1]
+                               ], stats.std[..., : x.shape[-1]]
         return (x - mean) / (std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
@@ -187,7 +188,8 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        data["image"] = {k: image_tools.resize_with_pad(
+            v, self.height, self.width) for k, v in data["image"].items()}
         return data
 
 
@@ -216,8 +218,18 @@ class DeltaActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        # RLDS / tf.data `as_numpy_iterator()` may return read-only NumPy views. Since this
+        # transform performs in-place edits, ensure `actions` is writeable.
+        if isinstance(actions, np.ndarray) and not actions.flags.writeable:
+            actions = np.array(actions, copy=True)
+        actions[..., :dims] -= np.expand_dims(
+            np.where(mask, state[..., :dims], 0), axis=-2)
+
         data["actions"] = actions
+        # actions = np.array(actions, copy=True)
+        # offset = np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        # actions[..., :dims] = actions[..., :dims] - offset
+        # data["actions"] = actions
 
         return data
 
@@ -238,8 +250,18 @@ class AbsoluteActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        # RLDS / tf.data `as_numpy_iterator()` may return read-only NumPy views. Since this
+        # transform performs in-place edits, ensure `actions` is writeable.
+        if isinstance(actions, np.ndarray) and not actions.flags.writeable:
+            actions = np.array(actions, copy=True)
+        actions[..., :dims] += np.expand_dims(
+            np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
+
+        # actions = np.array(actions, copy=True)
+        # offset = np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        # actions[..., :dims] = actions[..., :dims] + offset
+        # data["actions"] = actions
 
         return data
 
@@ -278,7 +300,8 @@ class TokenizeFASTInputs(DataTransformFn):
             prompt = prompt.item()
 
         state, actions = data["state"], data.get("actions")
-        tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(prompt, state, actions)
+        tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(
+            prompt, state, actions)
         return {
             **data,
             "tokenized_prompt": tokens,
@@ -299,7 +322,8 @@ class ExtractFASTActions(DataTransformFn):
             return data
         # Model outputs are saved in "actions", but for FAST models they represent tokens.
         tokens = data.pop("actions")
-        actions = self.tokenizer.extract_actions(tokens.astype(np.int32), self.action_horizon, self.action_dim)
+        actions = self.tokenizer.extract_actions(tokens.astype(
+            np.int32), self.action_horizon, self.action_dim)
         return {
             **data,
             "actions": actions,
@@ -319,7 +343,8 @@ class PromptFromLeRobotTask(DataTransformFn):
 
         task_index = int(data["task_index"])
         if (prompt := self.tasks.get(task_index)) is None:
-            raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
+            raise ValueError(
+                f"{task_index=} not found in task mapping: {self.tasks}")
 
         return {**data, "prompt": prompt}
 
@@ -331,9 +356,11 @@ class PadStatesAndActions(DataTransformFn):
     model_action_dim: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        data["state"] = pad_to_dim(
+            data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
-            data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+            data["actions"] = pad_to_dim(
+                data["actions"], self.model_action_dim, axis=-1)
         return data
 
 
@@ -380,7 +407,8 @@ def transform_dict(patterns: Mapping[str, str | None], tree: at.PyTree) -> at.Py
     for k in data:
         for pattern, repl in compiled.items():
             if pattern.fullmatch(k):
-                new_k = pattern.sub(repl, k, count=1) if repl is not None else None
+                new_k = pattern.sub(
+                    repl, k, count=1) if repl is not None else None
                 break
         else:
             # Use the original key if no match is found.
@@ -394,7 +422,7 @@ def transform_dict(patterns: Mapping[str, str | None], tree: at.PyTree) -> at.Py
     # Validate the output structure to make sure that it can be unflattened.
     names = sorted(output)
     for i in range(len(names) - 1):
-        name, next_name = names[i : i + 2]
+        name, next_name = names[i: i + 2]
         if next_name.startswith(name + "/"):
             raise ValueError(f"Leaf '{name}' aliases a node of '{next_name}'")
 
@@ -458,3 +486,173 @@ def _assert_quantile_stats(norm_stats: at.PyTree[NormStats]) -> None:
             raise ValueError(
                 f"quantile stats must be provided if use_quantile_norm is True. Key {k} is missing q01 or q99."
             )
+
+
+@dataclasses.dataclass(frozen=True)
+class DeltaCartesianPose(DataTransformFn):
+    """将绝对位姿动作转换为增量位姿动作空间。
+
+    支持单臂与双臂两种末端位姿动作空间：
+    - 单臂：默认 7 维 [x, y, z, roll, pitch, yaw, gripper]（也可只提供前 3/6 维的 mask）
+    - 双臂：默认 14 维，前 7 维左腕、后 7 维右腕
+
+    前3维是位置(x,y,z)，后3维是欧拉角(roll,pitch,yaw)，角度差会 wrap 到 [-pi, pi]。
+    位置使用欧几里得距离，角度使用角度差。
+    """
+
+    # 布尔掩码，用于指定要转换为增量动作空间的位姿维度
+    # 长度可以小于实际维度数。如果为None，此变换无效。
+    # 参见 `make_bool_mask` 了解更多详情。
+    mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+
+        state, actions = data["state"], data["actions"]
+        mask = np.asarray(self.mask)
+        dims = int(mask.shape[-1])
+
+        # RLDS / tf.data `as_numpy_iterator()` may return read-only NumPy views. Since this
+        # transform performs in-place edits, ensure `actions` is writeable.
+        if isinstance(actions, np.ndarray) and not actions.flags.writeable:
+            actions = np.array(actions, copy=True)
+
+        # Decide single-arm vs dual-arm.
+        # - dims in {3, 6, 7}: single-arm mask.
+        # - dims == 14: dual-arm mask (left 7 + right 7).
+        # - dims == 7 and action/state are 14D: treat as per-wrist mask broadcast to both arms.
+        action_dim = int(actions.shape[-1])
+        state_dim = int(state.shape[-1])
+
+        wrists: list[tuple[int, np.ndarray]]
+        if dims in (3, 6, 7):
+            if dims == 7 and action_dim >= 14 and state_dim >= 14:
+                wrists = [(0, mask), (7, mask)]
+            else:
+                wrists = [(0, mask)]
+        elif dims == 14:
+            wrists = [(0, mask[:7]), (7, mask[7:14])]
+        else:
+            raise ValueError(
+                f"DeltaCartesianPose expects mask length 3/6/7 (single) or 14 (dual), got {dims}"
+            )
+
+        def _apply_one_wrist(offset: int, wrist_mask: np.ndarray) -> None:
+            wdims = int(wrist_mask.shape[-1])
+            if wdims < 3:
+                raise ValueError(
+                    f"DeltaCartesianPose requires at least 3 dims per wrist (position), got {wdims}"
+                )
+
+            # position (x,y,z)
+            pos_mask = wrist_mask[:3]
+            pos_state = state[..., offset: offset + 3]
+            pos_state_masked = np.where(pos_mask, pos_state, 0)
+            actions[..., offset: offset + 3] -= np.expand_dims(pos_state_masked, axis=-2)
+
+            # euler angles (roll,pitch,yaw) in radians if provided
+            if wdims >= 6:
+                ang_mask = wrist_mask[3:6]
+                ang_state = state[..., offset + 3: offset + 6]
+                ang_state_masked = np.where(ang_mask, ang_state, 0)
+                ang = actions[..., offset + 3: offset + 6] - np.expand_dims(ang_state_masked, axis=-2)
+                ang = (ang + np.pi) % (2 * np.pi) - np.pi
+                actions[..., offset + 3: offset + 6] = ang
+
+            # optional 7th dim (typically gripper)
+            if wdims >= 7:
+                extra_mask = wrist_mask[6:7]
+                if extra_mask.shape[-1] == 1 and bool(extra_mask[0]):
+                    extra_state = state[..., offset + 6: offset + 7]
+                    extra_state_masked = np.where(extra_mask, extra_state, 0)
+                    actions[..., offset + 6: offset + 7] -= np.expand_dims(extra_state_masked, axis=-2)
+
+        for offset, wrist_mask in wrists:
+            _apply_one_wrist(offset, wrist_mask)
+        data["actions"] = actions
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class AbsoluteCartesianPose(DataTransformFn):
+    """将增量位姿动作转换为绝对位姿动作空间。
+
+    支持单臂与双臂两种末端位姿动作空间：
+    - 单臂：默认 7 维 [x, y, z, roll, pitch, yaw, gripper]（也可只提供前 3/6 维的 mask）
+    - 双臂：默认 14 维，前 7 维左腕、后 7 维右腕
+
+    前3维是位置(x,y,z)，后3维是欧拉角(roll,pitch,yaw)，角度和会 wrap 到 [-pi, pi]。
+    位置使用欧几里得距离，角度使用角度和。
+    """
+
+    # 布尔掩码，用于指定要转换为绝对动作空间的位姿维度
+    # 长度可以小于实际维度数。如果为None，此变换无效。
+    # 参见 `make_bool_mask` 了解更多详情。
+    mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+
+        state, actions = data["state"], data["actions"]
+        mask = np.asarray(self.mask)
+        dims = int(mask.shape[-1])
+
+        # RLDS / tf.data `as_numpy_iterator()` may return read-only NumPy views. Since this
+        # transform performs in-place edits, ensure `actions` is writeable.
+        if isinstance(actions, np.ndarray) and not actions.flags.writeable:
+            actions = np.array(actions, copy=True)
+
+        action_dim = int(actions.shape[-1])
+        state_dim = int(state.shape[-1])
+
+        wrists: list[tuple[int, np.ndarray]]
+        if dims in (3, 6, 7):
+            if dims == 7 and action_dim >= 14 and state_dim >= 14:
+                wrists = [(0, mask), (7, mask)]
+            else:
+                wrists = [(0, mask)]
+        elif dims == 14:
+            wrists = [(0, mask[:7]), (7, mask[7:14])]
+        else:
+            raise ValueError(
+                f"AbsoluteCartesianPose expects mask length 3/6/7 (single) or 14 (dual), got {dims}"
+            )
+
+        def _apply_one_wrist(offset: int, wrist_mask: np.ndarray) -> None:
+            wdims = int(wrist_mask.shape[-1])
+            if wdims < 3:
+                raise ValueError(
+                    f"AbsoluteCartesianPose requires at least 3 dims per wrist (position), got {wdims}"
+                )
+
+            # position (x,y,z)
+            pos_mask = wrist_mask[:3]
+            pos_state = state[..., offset: offset + 3]
+            pos_state_masked = np.where(pos_mask, pos_state, 0)
+            actions[..., offset: offset + 3] += np.expand_dims(pos_state_masked, axis=-2)
+
+            # euler angles (roll,pitch,yaw) in radians if provided
+            if wdims >= 6:
+                ang_mask = wrist_mask[3:6]
+                ang_state = state[..., offset + 3: offset + 6]
+                ang_state_masked = np.where(ang_mask, ang_state, 0)
+                ang = actions[..., offset + 3: offset + 6] + np.expand_dims(ang_state_masked, axis=-2)
+                ang = (ang + np.pi) % (2 * np.pi) - np.pi
+                actions[..., offset + 3: offset + 6] = ang
+
+            # optional 7th dim (typically gripper)
+            if wdims >= 7:
+                extra_mask = wrist_mask[6:7]
+                if extra_mask.shape[-1] == 1 and bool(extra_mask[0]):
+                    extra_state = state[..., offset + 6: offset + 7]
+                    extra_state_masked = np.where(extra_mask, extra_state, 0)
+                    actions[..., offset + 6: offset + 7] += np.expand_dims(extra_state_masked, axis=-2)
+
+        for offset, wrist_mask in wrists:
+            _apply_one_wrist(offset, wrist_mask)
+        data["actions"] = actions
+
+        return data

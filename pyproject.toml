@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Physical Intelligence open source repo"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
 dependencies = [
     "augmax>=0.3.4",
     "dm-tree>=0.1.8",
@@ -37,6 +36,21 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "tensorflow-cpu==2.15.0",
+    "tensorflow-datasets==4.9.9",
+    "seaborn>=0.12.0",
+    "matplotlib>=3.10.0",
+    "pandas>=2.3.1",
+    "huggingface-hub>=0.32.3",
+    "ffmpeg>=1.4",
+    "dlimp",
+    "libero",
+    "robosuite==1.4.1",
+    "future==0.18.2",
+    "gym==0.25.2",
+    "easydict==1.9",
+    "bddl==1.0.1",
+    "pin==2.7.0"
 ]
 
 
@@ -64,7 +78,7 @@ override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
-lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
+lerobot = { path = "../lerobot" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]
