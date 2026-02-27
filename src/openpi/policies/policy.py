@@ -88,16 +88,21 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
-        start_time = time.monotonic()
-        outputs = {
+        start_time = time.perf_counter()
+        raw_outputs = {
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
-        model_time = time.monotonic() - start_time
-        if self._is_pytorch_model:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+        # Sync so elapsed time includes actual GPU work (JAX is lazy; PyTorch may queue ops).
+        if self._is_pytorch_model and self._pytorch_device.startswith("cuda"):
+            torch.cuda.synchronize()
         else:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+            jax.block_until_ready(raw_outputs["actions"])
+        model_time = time.perf_counter() - start_time
+        if self._is_pytorch_model:
+            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), raw_outputs)
+        else:
+            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), raw_outputs)
 
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {

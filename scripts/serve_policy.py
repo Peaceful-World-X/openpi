@@ -118,5 +118,10 @@ def main(args: Args) -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, force=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        force=True,
+        format="%(asctime)s,%(msecs)03d %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     main(tyro.cli(Args))
