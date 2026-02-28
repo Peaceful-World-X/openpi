@@ -31,7 +31,7 @@ from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.errors import RevisionNotFoundError
 
 from lerobot.common.constants import HF_LEROBOT_HOME
-from lerobot.common.datasets.compute_stats import aggregate_stats, get_feature_stats
+from lerobot.common.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.common.datasets.image_writer import AsyncImageWriter, write_image
 from lerobot.common.datasets.utils import (
     DEFAULT_FEATURES,
@@ -72,7 +72,6 @@ from lerobot.common.datasets.video_utils import (
     get_safe_default_codec,
     get_video_info,
 )
-import imageio.v3 as iio
 from lerobot.common.robot_devices.robots.utils import Robot
 
 CODEBASE_VERSION = "v2.1"
@@ -820,7 +819,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     f"An element of the frame is not in the features. '{key}' not in '{self.features.keys()}'."
                 )
 
-            if self.features[key]["dtype"] in ["image"]:
+            if self.features[key]["dtype"] in ["image", "video"]:
                 img_path = self._get_image_file_path(
                     episode_index=self.episode_buffer["episode_index"], image_key=key, frame_index=frame_index
                 )
@@ -833,7 +832,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self.episode_buffer["size"] += 1
 
-    def save_episode(self, episode_data: dict | None = None, mode: str = "video") -> None:
+    def save_episode(self, episode_data: dict | None = None) -> None:
         """
         This will save to disk the current episode in self.episode_buffer.
 
@@ -874,29 +873,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
-        # ep_stats = compute_episode_stats(episode_buffer, self.features)
-        ep_stats = {}
-        for key, data in episode_buffer.items():
-            if key in ["observation.state", "action"]:
-                ep_ft_array = data  # data is already a np.ndarray
-                axes_to_reduce = 0  # compute stats over the first axis
-                keepdims = data.ndim == 1  # keep as np.array
-                ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
+        ep_stats = compute_episode_stats(episode_buffer, self.features)
 
-        if mode == "video": 
-            for key in self.meta.video_keys:
-                video = self.episode_buffer[key]
-                video_path = self.root / self.meta.get_video_file_path(episode_index, key)
-                video_path.parent.mkdir(parents=True, exist_ok=True)
-                iio.imwrite(
-                    video_path, 
-                    video, 
-                    fps=self.fps,
-                    # codec="libx264",         # H.264 编码器，兼容性好
-                    quality=7,                 # 质量 0-10（10 = 无损压缩）
-                    macro_block_size=None      # 避免强制对齐，保持原始分辨率)
-                )
-        elif len(self.meta.video_keys) > 0:
+        if len(self.meta.video_keys) > 0:
             video_paths = self.encode_episode_videos(episode_index)
             for key in self.meta.video_keys:
                 episode_buffer[key] = video_paths[key]
