@@ -5,6 +5,10 @@ import socket
 
 import tyro
 
+# Suppress noisy third-party logs (JAX backend discovery, orbax flags) before importing JAX.
+for _logger_name in ("jax", "jax._src.xla_bridge", "absl", "orbax", "orbax.checkpoint"):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
+
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
