@@ -83,7 +83,7 @@ override-dependencies = [
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
-lerobot = { path = "/home/cyto/code/lerobot" }
+lerobot = { path = "../lerobot" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]
