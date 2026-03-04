@@ -58,6 +58,24 @@ export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 ---
 ## 2. 云端-A800
 
+### 初始化
+```bash
+# 初始化容器（卷必须用 :z 才能在有 SELinux 的宿主机上写入；:rw 无效）
+docker run -it \
+  --name openpi \
+  --init \
+  --gpus all \
+  --shm-size=64G \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  -e CUDA_VISIBLE_DEVICES=0 \
+  -p 8000:8000 \
+  -v /home/xuewenyao/code:/home/cyto/code:z \
+  -v /home/models:/home/models:z \
+  -v /home/results:/home/results:z \
+  -v $HOME/.cache/uv:/root/.cache/uv:z \
+  openpi:v3.0
+```
+
 ### 推理
 ```bash
 # 进入环境
