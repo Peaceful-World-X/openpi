@@ -42,12 +42,11 @@ GIT_LFS_SKIP_SMUDGE=1 uv sync
 ```bash
 # 进入环境
 docker start openpi && docker exec -u 0 -it openpi bash -c "cd /home/cyto/code/openpi && exec /bin/bash"
-# 推理 分配 8G 左右
+# 推理 分配 8.5G 左右
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.5
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
 uv run scripts/serve_policy.py policy:checkpoint \
-  --policy.config=pi05_cytoderm11_joint_arm_move \
-  --policy.dir=/home/results/openpi/checkpoints/pi05_cytoderm11_joint_arm_move/my_experiment_cytoderm11_joint_007/40000 
+  --policy.dir=/home/results/openpi/checkpoints/pi05_cytoderm11_joint_arm_move/my_experiment_cytoderm11_joint_007/40000
 
 
 # RTX 4060

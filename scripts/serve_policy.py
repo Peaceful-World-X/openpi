@@ -1,6 +1,7 @@
 import dataclasses
 import enum
 import logging
+import pathlib
 import socket
 
 import tyro
@@ -24,14 +25,29 @@ class EnvMode(enum.Enum):
     LIBERO = "libero"
 
 
+def _infer_config_from_checkpoint_dir(checkpoint_dir: str) -> str:
+    """Infer config name from checkpoint path.
+
+    Training saves under checkpoint_base_dir / config_name / exp_name / step.
+    So config_name is the parent of the parent of the given path.
+    """
+    path = pathlib.Path(checkpoint_dir).resolve()
+    if path.name.isdigit():
+        # Path is .../config_name/exp_name/step
+        return path.parent.parent.name
+    # Path might be .../config_name/exp_name (no step); use parent.
+    return path.parent.name
+
+
 @dataclasses.dataclass
 class Checkpoint:
     """Load a policy from a trained checkpoint."""
 
-    # Training config name (e.g., "pi0_aloha_sim").
-    config: str
+    # Training config name (e.g., "pi0_aloha_sim"). If None, inferred from dir:
+    # path is .../config_name/exp_name/step so config = parent.parent.name.
+    config: str | None = None
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
-    dir: str
+    dir: str = ""
 
 
 @dataclasses.dataclass
@@ -93,8 +109,11 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            if not args.policy.dir:
+                raise ValueError("policy.dir is required when using policy:checkpoint")
+            config_name = args.policy.config or _infer_config_from_checkpoint_dir(args.policy.dir)
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(config_name), args.policy.dir, default_prompt=args.default_prompt
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
