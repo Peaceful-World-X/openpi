@@ -47,6 +47,7 @@ CONFIG_NAME: dict[str, type[RLDSDatasetType]] = {
     # Truth RLDS Dataset (Joint space without gripper)
     "pi05_cytoderm10_joint_arm_move": TruthRldsDatasetJointWithoutGripper,
     "pi05_cytoderm11_joint_arm_move": TruthRldsDatasetJointWithoutGripper,
+    "pi05_cytoderm14_joint_arm_move": TruthRldsDatasetJointWithoutGripper,
     # DROID RLDS Dataset
     "pi0_fast_droid_finetune": DroidRldsDataset,
     "pi0_fast_droid_finetune_new": DroidRldsNewDataset,

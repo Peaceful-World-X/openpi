@@ -1584,7 +1584,40 @@ _CONFIGS = [
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),
 
+    TrainConfig(
+        # This config is for fine-tuning pi05 on the *full* DROID dataset.
+        # We use RLDS data loading to make training on this large dataset tractable.
+        # For fine-tuning on your own DROID dataset, see below.
+        name="pi05_cytoderm14_joint_arm_move",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=RLDSTruthJointWithoutGripperDataConfig(
+            repo_id="cytoderm14_dataset",
+            # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
+            rlds_data_dir="/home/datasets/ours_dataset/",
+            action_space=truth_rlds_dataset.TruthActionSpace.JOINT_POSITION,
+            downsampled_and_repeated=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/yaomingyuan/Program/openpi_main/checkpoints/pi05_cytoderm10_joint_arm_move_20000/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=256,
+        log_interval=100,
+        save_interval=5000,
+        keep_period=10_000,
+        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+    ),
 
+    # ===============================================================================================================================================================
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #

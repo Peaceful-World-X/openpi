@@ -43,9 +43,15 @@ docker start openpi && docker exec -u 0 -it openpi bash -c "cd /home/cyto/code/o
 # 推理 分配 8.5G 左右
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+# 第一版
 uv run scripts/serve_policy.py policy:checkpoint \
   --policy.dir=/home/results/openpi/checkpoints/pi05_cytoderm11_joint_arm_move/my_experiment_cytoderm11_joint_007/40000
 
+# 第二版：自动复位、但是反应迟钝
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.dir=/home/results/openpi/checkpoints/pi05_cytoderm14_joint_arm_move/my_experiment_cytoderm13_joint_007/40000/
+
+# ---------------------------------------------------------------------------------------------------------------------
 # 使用 8010 端口
 uv run scripts/serve_policy.py --port=8010 policy:checkpoint \
   --policy.dir=/home/results/openpi/checkpoints/pi05_cytoderm11_joint_arm_move/my_experiment_cytoderm11_joint_007/40000
