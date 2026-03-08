@@ -14,12 +14,9 @@ sudo apt update && sudo apt install -y pv && pv -p -t -e -r -b openpi_v3.tar | d
 # 传模型文件
 sudo rsync -avzP --mkpath --progress cyto@172.16.10.40:/home/cyto/results/ /home/results/
 # 把 swap 调整为 32G
-sudo swapoff -a && \
-sudo rm -f /swapfile && \
-sudo fallocate -l 32G /swapfile && \
-sudo chmod 600 /swapfile && \
-sudo mkswap /swapfile && \
-sudo swapon /swapfile && \
+sudo swapoff -a && sudo rm -f /swapfile && \
+sudo fallocate -l 32G /swapfile && sudo chmod 600 /swapfile && \
+sudo mkswap /swapfile && sudo swapon /swapfile && \
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 # 初始化容器
 docker run -it \
@@ -28,7 +25,7 @@ docker run -it \
   --gpus all \
   --shm-size=16G \
   --network host \
-  -v /home/用户名/code:/home/cyto/code \
+  -v /home/cyto/code:/home/cyto/code \
   -v /home/models:/home/models \
   -v /home/results:/home/results \
   -v $HOME/.cache/uv:/root/.cache/uv \
@@ -42,14 +39,23 @@ GIT_LFS_SKIP_SMUDGE=1 uv sync
 ```bash
 # 进入环境
 docker start openpi && docker exec -u 0 -it openpi bash -c "cd /home/cyto/code/openpi && exec /bin/bash"
+
 # 推理 分配 8.5G 左右
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
 uv run scripts/serve_policy.py policy:checkpoint \
   --policy.dir=/home/results/openpi/checkpoints/pi05_cytoderm11_joint_arm_move/my_experiment_cytoderm11_joint_007/40000
 
+# 使用 8010 端口
+uv run scripts/serve_policy.py --port=8010 policy:checkpoint \
+  --policy.dir=/home/results/openpi/checkpoints/pi05_cytoderm11_joint_arm_move/my_experiment_cytoderm11_joint_007/40000
 
-# RTX 4060
+# 原始命令
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=pi05_cytoderm11_joint_arm_move \
+  --policy.dir=/home/results/openpi/checkpoints/pi05_cytoderm11_joint_arm_move/my_experiment_cytoderm11_joint_007/40000
+
+# RTX 4060（8G 显存）
 export XLA_PYTHON_CLIENT_MEM_FRACTION=1
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 ```
@@ -67,7 +73,7 @@ docker run -it \
   --shm-size=64G \
   -e NVIDIA_VISIBLE_DEVICES=all \
   -e CUDA_VISIBLE_DEVICES=0 \
-  -p 8000:8000 \
+  -p 8000-8010:8000-8010 \
   -v /home/xuewenyao/code:/home/cyto/code:z \
   -v /home/models:/home/models:z \
   -v /home/results:/home/results:z \
