@@ -34,8 +34,13 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         while True:
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
+                # ping_timeout=60: inference can block recv() for >20s; avoid 1011.
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    additional_headers=headers,
+                    ping_timeout=60,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata

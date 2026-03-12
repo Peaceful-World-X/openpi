@@ -35,12 +35,14 @@ class WebsocketPolicyServer:
         asyncio.run(self.run())
 
     async def run(self):
+        # ping_timeout=60: client may block in recv() during long inference; avoid 1011.
         async with _server.serve(
             self._handler,
             self._host,
             self._port,
             compression=None,
             max_size=None,
+            ping_timeout=60,
             process_request=_health_check,
         ) as server:
             await server.serve_forever()
