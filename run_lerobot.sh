@@ -1,3 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
+export LEROBOT_IMPL=fast_convert
+export LEROBOT_WORKSPACE="$ROOT_DIR/lerobot_dataset"
+
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH
+
 # Multi-Processing Data conversion
 DATA_ROOT=/shared_disk/datasets/private_datasets/robot_data/agilex_data/unfold_shirt
 uv run  examples/aloha_real/convert_songling_aloha_data_to_lerobot_mp.py \

@@ -10,7 +10,7 @@ import pandas as pd
 from termcolor import colored
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import datasets
-from lerobot.common.datasets.utils import write_parquet,get_hf_features_from_features
+from lerobot.common.datasets.utils import embed_images, get_hf_features_from_features
 
 FEATURES = None
 
@@ -83,7 +83,8 @@ def save_parquet(data_df, save_path):
     data_df_dict = data_df.to_dict(orient='list')
     episode_dict = {key: np.array(data_df_dict[key]) for key in FEATURES}
     ep_dataset = datasets.Dataset.from_dict(episode_dict, features=FEATURES, split="train")
-    write_parquet(ep_dataset,save_path)
+    ep_dataset = embed_images(ep_dataset)
+    ep_dataset.to_parquet(save_path)
 
 def merge_stats(stats_list):
     """
@@ -1316,7 +1317,7 @@ def merge_datasets(
     # 从info.json获取chunks_size
     info_path = os.path.join(source_folders[0], "meta", "info.json")
     global FEATURES
-    FEATURES = get_hf_features_from_features(lerobot_dataset.LeRobotDatasetMetadata("debug", root=source_folders[0], local_files_only=True).features)
+    FEATURES = get_hf_features_from_features(lerobot_dataset.LeRobotDatasetMetadata("debug", root=source_folders[0]).features)
     
     # Check if all source folders have images directory
     images_dir_exists = all(os.path.exists(os.path.join(folder, "images")) for folder in source_folders)

@@ -894,7 +894,7 @@ _CONFIGS = [
             #     local_files_only=True,  # Set to True for local-only datasets.
             # ),
             use_delta_joint_actions=True,
-            adapt_to_pi=True,
+            adapt_to_pi=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,

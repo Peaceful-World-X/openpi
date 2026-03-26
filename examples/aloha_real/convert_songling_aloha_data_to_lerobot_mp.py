@@ -13,9 +13,8 @@ from typing import Literal
 from multiprocessing import Process
 
 import h5py
-from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
+from lerobot.common.constants import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.push_dataset_to_hub._download_raw import download_raw
 import numpy as np
 import torch
 import tqdm
@@ -119,8 +118,8 @@ def create_empty_dataset(
             ],
         }
 
-    if Path(LEROBOT_HOME / repo_id).exists():
-        shutil.rmtree(LEROBOT_HOME / repo_id)
+    if Path(HF_LEROBOT_HOME / repo_id).exists():
+        shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
     return LeRobotDataset.create(
         root=out_dir,
@@ -234,10 +233,12 @@ def populate_dataset(
                 frame["observation.velocity"] = velocity[i]
             if effort is not None:
                 frame["observation.effort"] = effort[i]
+            if task is not None:
+                frame["task"] = task
 
             dataset.add_frame(frame)
 
-        dataset.save_episode(task=task)
+        dataset.save_episode()
 
     return dataset
 
@@ -272,8 +273,8 @@ def port_aloha(
     rotatfile.setFormatter(formatter)
                         
 
-    if (LEROBOT_HOME / repo_id).exists():
-        shutil.rmtree(LEROBOT_HOME / repo_id)
+    if (HF_LEROBOT_HOME / repo_id).exists():
+        shutil.rmtree(HF_LEROBOT_HOME / repo_id)
     
     hdf5_files = []
     for raw_dir in raw_dirs:

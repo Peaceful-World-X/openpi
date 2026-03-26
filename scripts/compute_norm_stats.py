@@ -96,7 +96,12 @@ def main(config_name: str, max_frames: int | None = None):
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config=data_config,
+            action_horizon=config.model.action_horizon,
+            batch_size=1,
+            model_config=config.model,
+            num_workers=8,
+            max_frames=max_frames,
         )
 
     keys = ["state", "actions"]
@@ -108,7 +113,11 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = ''
+    if isinstance(data_config.repo_id, list):
+        output_path = config.assets_dirs / data_config.asset_id
+    elif isinstance(data_config.repo_id, str):
+        output_path = config.assets_dirs / data_config.asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
