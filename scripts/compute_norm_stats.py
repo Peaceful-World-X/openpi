@@ -115,9 +115,9 @@ def main(config_name: str, max_frames: int | None = None):
 
     output_path = ''
     if isinstance(data_config.repo_id, list):
-        output_path = config.assets_dirs / data_config.repo_id[0]
+        output_path = config.assets_dirs / data_config.asset_id
     elif isinstance(data_config.repo_id, str):
-        output_path = config.assets_dirs / data_config.repo_id
+        output_path = config.assets_dirs / data_config.asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

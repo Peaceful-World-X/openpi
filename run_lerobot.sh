@@ -7,7 +7,9 @@ export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 export LEROBOT_IMPL=fast_convert
 export LEROBOT_WORKSPACE="$ROOT_DIR/lerobot_dataset"
 
-export HF_LEROBOT_HOME=/mnt/pfs/users/yang.wang/data
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH
 
 # Multi-Processing Data conversion
 DATA_ROOT=/shared_disk/datasets/private_datasets/robot_data/agilex_data/unfold_shirt
