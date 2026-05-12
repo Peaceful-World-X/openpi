@@ -6,7 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias, Union, List
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -63,7 +63,7 @@ class AssetsConfig:
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
-    repo_id: str | None = None
+    repo_id: Union[str, List[str]] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -168,7 +168,7 @@ class ModelTransformFactory(GroupFactory):
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
-    repo_id: str = tyro.MISSING
+    repo_id: Union[str, List[str]] = tyro.MISSING
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -238,7 +238,9 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
-
+    mask_list: list[int] | None = None  # [7, -1, 7, -1, 1]
+    zero_mask_list: list[int] | None = None  # e.g. [-16, 3, -13] to zero dims [16, 17, 18]
+    action_horizon: int = 17
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -259,14 +261,11 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
-            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+            inputs=[aloha_policy.AlohaInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi, zero_mask_list=self.zero_mask_list)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi, action_horizon=self.action_horizon)],
         )
         if self.use_delta_joint_actions:
-            if self.adapt_to_pi:
-                delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)  # Aloha/Songling
-            else:
-                delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)  # G1
+            delta_action_mask = _transforms.make_bool_mask(*self.mask_list)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -495,7 +494,7 @@ class TrainConfig:
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "/shared_disk/users/yang.wang/checkpoint"
+    checkpoint_base_dir: str = "/shared_disk/users/can.jin/checkpoint"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -828,59 +827,20 @@ _CONFIGS = [
     #
     # Personal Config for compute norm.
     #
-    
-    TrainConfig(
-        name="pi05_norm_compute_self",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotAlohaDataConfig(
-            # 加载数据路径
-            repo_id="/shared_disk/datasets/private_datasets/robot_data/agilex_data/clean_desk/lerobot_format/0908_clean_desk_base_data",
-            assets=AssetsConfig(
-                # 加载norm路径
-                assets_dir="/mnt/pfs/users/xumengyuan/code/OpenPI0.5/openpi/assets",
-                asset_id="songling",
-            ),
-            default_prompt="uncap the pen",
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=20_000,
-        batch_size=64,
-        num_workers=32,
-    ),
-
+    # aloha_piper config
     TrainConfig(
         # 任务名
-        name="pi05_aloha_piper_fold_shirt_exp1001",
+        name="pi05_benchmark_open_water_0501",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
             # 加载多数据路径
-            repo_id=[
-                "giga-brain/fold_shirt_0912_01hsq_gree_blue_0",  # 138
-                "giga-brain/fold_shirt_0912_01hsq_gree_blue_1",  # 83
-                "giga-brain/fold_shirt_0912_01hsq_gree_blue_2",  # 61
-                "giga-brain/fold_shirt_0923_01hsq_gree_blue_0",  # 190
-            ],
+            repo_id='/shared_disk/users/can.jin/dataset/agilex/benchmark_open_water_0501/260501190118_4464',
             assets=AssetsConfig(
                 # 加载norm路径
-                assets_dir="/mnt/pfs/users/yang.wang/code/GigaBrain-OpenPI05/assets",
-                asset_id="songling",
+                assets_dir="/mnt/pfs/users/can.jin/public/norm_stats/assets",
+                asset_id="benchmark_open_water_0501",
             ),
-            default_prompt="fold the shirt",
+            base_config=DataConfig(prompt_from_task=True),
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
@@ -892,6 +852,7 @@ _CONFIGS = [
                             },
                             "state": "observation.state",
                             "actions": "action",
+                            "prompt": "prompt",
                         }
                     )
                 ]
@@ -900,27 +861,29 @@ _CONFIGS = [
             #     local_files_only=True,  # Set to True for local-only datasets.
             # ),
             use_delta_joint_actions=True,
+            action_horizon=14,
+            mask_list=[6, -1, 6, -1],
             adapt_to_pi=True, # Aloha/Songling
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
-        checkpoint_base_dir = "/shared_disk/users/yang.wang/checkpoint",
         num_train_steps=40_000,
         batch_size=128,
         num_workers=64,
     ),
-
+    # g1 arm config
     TrainConfig(
-        name="pi05_zhiyuan_g1_flat_fold_shirt_exp0918",
+        name="pi05_lerobot_merged_204_333_428_634_n300",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
             # 加载数据路径
             repo_id="/shared_disk/users/yang.wang/data-g1/flat_fold_shirt/aligned_data/lerobot_merged_204_333_428_634_n300",
             assets=AssetsConfig(
                 # 加载norm路径
-                assets_dir="/mnt/pfs/users/yang.wang/code/OpenPI0.5/openpi/assets",
-                asset_id="agibotg1",
+                assets_dir="/mnt/pfs/users/can.jin/public/norm_stats/assets/",
+                asset_id="lerobot_merged_204_333_428_634_n300",
             ),
             default_prompt="fold the shirt",
+            # base_config=DataConfig(prompt_from_task=True),
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
@@ -932,6 +895,7 @@ _CONFIGS = [
                             },
                             "state": "observation.state",
                             "actions": "action",
+                            # "prompt": "prompt",
                         }
                     )
                 ]
@@ -940,47 +904,30 @@ _CONFIGS = [
             #     local_files_only=True,  # Set to True for local-only datasets.
             # ),
             use_delta_joint_actions=True,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
             adapt_to_pi=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
-        # num_train_steps=40_000,
         num_train_steps=40_0000,
+        # batch_size=8,
+        # num_workers=2,
         batch_size=128,
         num_workers=64,
     ),
+    # g1 arm + waist(only height) config
     TrainConfig(
-        name="pi05_zhiyuan_g1_fold_shirt_exp1001",
+        name="pi05_fast_3_data_carry_box_b1_fast_0316_merged",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
-            # 加载数据路径
-            # repo_id=[
-            #     "giga-brain/fold_shirt_0912_01hsq_gree_blue_0",  # 138
-            #     "giga-brain/fold_shirt_0912_01hsq_gree_blue_1",  # 83
-            #     "giga-brain/fold_shirt_0912_01hsq_gree_blue_2",  # 61
-            #     "giga-brain/fold_shirt_0923_01hsq_gree_blue_0",  # 190
-            #     "giga-brain/fold_shirt_0923_02qqb_only_green_0", # 150
-            #     "giga-brain/fold_shirt_0923_03txq_only_green_0", # 271
-            #     "giga-brain/fold_shirt_0923_04ljy_only_green_0", # 250
-            #     "giga-brain/fold_shirt_0923_05wys_only_green_0", # 250
-            # ],
-            repo_id=[
-                "giga-brain/zhiyuan_g1_fold_shirt_bucket52_173_160_251_merged",
-                "giga-brain/fold_shirtv1_0_906_176",
-                "giga-brain/fold_shirtv1_1_906_99",
-                "giga-brain/fold_shirtv2_0_906_74",
-                "giga-brain/fold_shirtv2_1_906_148",
-                # "giga-brain/fold_shirtv2_2_906_74", # bug
-                "giga-brain/fold_shirtv3_0_906_123",
-                "giga-brain/fold_shirtv3_1_906_62",
-                # "giga-brain/fold_shirtv3_2_906_62", # bug
-                "giga-brain/fold_shirtv4_0_906_88",
-            ],
+            # 记载数据路径
+            repo_id="/mnt/pfs/users/can.jin/public/datasets/mix_merge/fast_3_data_carry_box_b1_fast_0316_merged",
             assets=AssetsConfig(
-                # 加载norm路径
-                assets_dir="/mnt/pfs/users/yang.wang/code/OpenPI0.5-MultiData/assets",
-                asset_id="agibotg1",
+                # 加载norm路径 计算时不用管
+                assets_dir="/mnt/pfs/users/can.jin/public/norm_stats/assets/",
+                asset_id="fast_3_data_carry_box_b1_fast_0316_merged",
             ),
-            default_prompt="fold the shirt",
+            base_config=DataConfig(prompt_from_task=True),
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
@@ -992,66 +939,127 @@ _CONFIGS = [
                             },
                             "state": "observation.state",
                             "actions": "action",
+                            "prompt": "prompt",
+
                         }
                     )
                 ]
             ),
-            # base_config=DataConfig(
-            #     local_files_only=True,  # Set to True for local-only datasets.
-            # ),
-            use_delta_joint_actions=True,
             adapt_to_pi=False,
+            action_horizon=20,
+            mask_list=[7, -1, 7, -1, 4],
+            zero_mask_list=[-16, 3, -1, 12],
+            use_delta_joint_actions=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=80_000,
+        num_train_steps=40_000,
+        # batch_size=1,
+        # num_workers=1,  
         batch_size=128,
         num_workers=64,
+        checkpoint_base_dir = "/shared_disk/users/can.jin/model/openpi",
     ),
+    # h01 arm config
     TrainConfig(
-        name="pi05_zhiyuan_g1_fold_shirt_exp1029",
+        name="pi05_build_block_0501_merged",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
-            # 加载数据路径
-            repo_id=[
-                "giga-brain/fold_shirt_0928_01hsq_new_green_blue_only_s_0",
-                "giga-brain/fold_shirt_0928_02qqb_new_s_or_m_0",
-                "giga-brain/fold_shirt_0928_03txq_new_green_blue_only_s_0",
-                "giga-brain/fold_shirt_0928_04ljy_new_s_or_m_0",
-                "giga-brain/fold_shirt_0928_05wys_new_s_or_m_0",
-            ],
+            # 记载数据路径
+            repo_id="/shared_disk/users/can.jin/dataset/h01_robot/h01_benchmark/build_block_0501_merged",
             assets=AssetsConfig(
-                # 加载norm路径
-                assets_dir="/mnt/pfs/users/yang.wang/code/OpenPI0.5-MultiData/assets",
-                asset_id="agibotg1",
+                # 加载norm路径 计算时不用管
+                assets_dir="/mnt/pfs/users/can.jin/public/norm_stats/assets",
+                asset_id="build_block_0501_merged",
             ),
-            default_prompt="fold the shirt",
+            base_config=DataConfig(prompt_from_task=True),
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
                         {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
                             "state": "observation.state",
                             "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist_up": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist_up": "observation.images.cam_right_wrist_up",
+                                "cam_left_wrist_down": "observation.images.cam_left_wrist_down",
+                                "cam_right_wrist_down": "observation.images.cam_right_wrist_down",
+                            },
+                            "prompt": "prompt",
                         }
                     )
                 ]
             ),
-            # base_config=DataConfig(
-            #     local_files_only=True,  # Set to True for local-only datasets.
-            # ),
-            use_delta_joint_actions=True,
             adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
         ),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/users/yang.wang/checkpoint/pi05_zhiyuan_g1_fold_shirt_exp1001/fold_shirt_c30n1500_gpu8_bs128/79999/params"),
-        num_train_steps=80_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
         batch_size=128,
         num_workers=64,
+        checkpoint_base_dir = "/shared_disk/users/can.jin/model/openpi",
     ),
+    # h01 arm + waist config
+    TrainConfig(
+        # 配置名称
+        name="pi05_fast_2_carry_subbox_b1_0509_merged",
+        # 用pi0还是pi05
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # lerobot v2.1数据集路径
+            repo_id="/shared_disk/users/can.jin/dataset/h01_robot/merge_fast/fast_2_carry_subbox_b1_0509_merged",
+            # 下面两个合起来是norm文件的目录，默认norm文件名为norm_stats.json
+            assets=AssetsConfig(
+                # 加载norm路径 计算时不用管
+                assets_dir="/mnt/pfs/users/can.jin/public/norm_stats/assets",
+                asset_id="fast_2_carry_subbox_b1_0509_merged",
+            ),
+            # 使用数据集中prompt
+            base_config=DataConfig(prompt_from_task=True),
+            # 映射字段，相机 state action
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist_up": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist_up": "observation.images.cam_right_wrist_up",
+                                "cam_left_wrist_down": "observation.images.cam_left_wrist_down",
+                                "cam_right_wrist_down": "observation.images.cam_right_wrist_down",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            # 如果是songling臂数据，需要设成true，h01和g1设为false
+            adapt_to_pi=False,
+            # 控制最后输出的action维度【50，20】
+            action_horizon=20,
+            # deltamask，如果是正数，使用相对值，如果是负数使用绝对值，对于qpos，一般夹爪绝对值，其他用相对值
+            mask_list=[7, -1, 7, -1, 4],
+            # zeromask，使用腰部数据是，一般不会用全部维度，不用的维度需要置零，避免影响loss计算。计算norm和此处都要置零。
+            # 负数表示对应的维度不置零，正数表示置零，有的数据会在action后面加上两个动作维度，不用的话，需要置零。
+            zero_mask_list=[-16, 1, -3, 12],
+            # 是否采用相对动作，和mask_list对应，为true的时候mask_list生效
+            use_delta_joint_actions=True,
+        ),
+        # 使用的预训练权重
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        # iter步数
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        # 训练结果存放位置
+        checkpoint_base_dir = "/shared_disk/users/can.jin/model/openpi",
+    ),
+   
     #
     # Fine-tuning DROID configs.
     #

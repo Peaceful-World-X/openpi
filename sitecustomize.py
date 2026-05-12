@@ -16,7 +16,6 @@ workspace = Path(
 
 impl_map = {
     "fast_convert": workspace / "lerobot_dataset_fast_convert.py",
-    "fast_norm": workspace / "lerobot_dataset_fast_norm.py",
     "train": workspace / "lerobot_dataset.py",
 }
 

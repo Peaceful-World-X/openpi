@@ -31,108 +31,81 @@ class AlohaInputs(transforms.DataTransformFn):
     - actions: [action_horizon, 14]
     """
 
+    action_dim: int
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
+    # Mask dims to zero out in state and actions, same format as delta mask.
+    # e.g. [-16, 3, -13] means 16 keep, 3 zero, 13 keep → zeros dims [16, 17, 18] in 32-dim space.
+    zero_mask_list: list[int] | None = None
 
     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
     # replaced with black images and the corresponding `image_mask` will be set to False.
-    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
+    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist", "cam_left_wrist_up", "cam_right_wrist_up", "cam_left_wrist_down", "cam_right_wrist_down")
 
 # 训练用
     def __call__(self, data: dict) -> dict:
         data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
-
-        in_images = data["images"]
-        if set(in_images) - set(self.EXPECTED_CAMERAS):
-            raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
-
-        # Assume that base image always exists.
-        base_image = in_images["cam_high"]
-
-        images = {
-            "base_0_rgb": base_image,
-        }
-        image_masks = {
-            "base_0_rgb": np.True_,
-        }
-
-        # Add the extra images.
-        extra_image_names = {
-            "left_wrist_0_rgb": "cam_left_wrist",
-            "right_wrist_0_rgb": "cam_right_wrist",
-        }
-        for dest, source in extra_image_names.items():
-            if source in in_images:
-                images[dest] = in_images[source]
-                image_masks[dest] = np.True_
-            else:
-                images[dest] = np.zeros_like(base_image)
-                image_masks[dest] = np.False_
-
+        state = transforms.pad_to_dim(data["state"], self.action_dim)
         inputs = {
-            "image": images,
-            "image_mask": image_masks,
-            "state": data["state"],
+            "state": state,
         }
+
+        if "images" in data:
+            in_images = data["images"]
+            if set(in_images) - set(self.EXPECTED_CAMERAS):
+                raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
+
+            # Assume that base image always exists.
+            base_image = in_images["cam_high"]
+
+            images = {
+                "base_0_rgb": base_image,
+            }
+            image_masks = {
+                "base_0_rgb": np.True_,
+            }
+
+            # Add the extra images.
+            extra_image_names = {
+                "left_wrist_0_rgb": "cam_left_wrist",
+                "right_wrist_0_rgb": "cam_right_wrist",
+                "left_wrist_1_rgb": "cam_left_wrist_up",
+                "right_wrist_1_rgb": "cam_right_wrist_up",
+                "left_wrist_2_rgb": "cam_left_wrist_down",
+                "right_wrist_2_rgb": "cam_right_wrist_down",
+            }
+            for dest, source in extra_image_names.items():
+                if source in in_images:
+                    images[dest] = in_images[source]
+                    image_masks[dest] = np.True_
+                else:
+                    images[dest] = np.zeros_like(base_image)
+                    image_masks[dest] = np.False_
+
+            inputs = {
+                "image": images,
+                "image_mask": image_masks,
+                "state": state,
+            }
 
         # Actions are only available during training.
         if "actions" in data:
             actions = np.asarray(data["actions"])
             actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
-            inputs["actions"] = actions
+            inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
+            # mask useless dim
+            if self.zero_mask_list is not None:
+                zero_mask = transforms.make_bool_mask(*self.zero_mask_list)
+                zm = np.asarray(zero_mask, dtype=bool)
+                inputs['actions'][:, zm] = 0
+                inputs['state'][zm] = 0
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
         return inputs
-# 计算norm用
-    # def __call__(self, data: dict) -> dict:
-    #     data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
-    #     if "images" in data:
-    #         in_images = data["images"]
-    #         if set(in_images) - set(self.EXPECTED_CAMERAS):
-    #             raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
 
-    #         # Assume that base image always exists.
-    #         base_image = in_images["cam_high"]
-
-    #         images = {
-    #             "base_0_rgb": base_image,
-    #         }
-    #         image_masks = {
-    #             "base_0_rgb": np.True_,
-    #         }
-
-    #         # Add the extra images.
-    #         extra_image_names = {
-    #             "left_wrist_0_rgb": "cam_left_wrist",
-    #             "right_wrist_0_rgb": "cam_right_wrist",
-    #         }
-    #         for dest, source in extra_image_names.items():
-    #             if source in in_images:
-    #                 images[dest] = in_images[source]
-    #                 image_masks[dest] = np.True_
-    #             else:
-    #                 images[dest] = np.zeros_like(base_image)
-    #                 image_masks[dest] = np.False_
-
-    #     inputs = {
-    #         # "image": images,
-    #         # "image_mask": image_masks,
-    #         "state": data["state"],
-    #     }
-
-    #     # Actions are only available during training.
-    #     if "actions" in data:
-    #         actions = np.asarray(data["actions"])
-    #         actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
-    #         inputs["actions"] = actions
-
-    #     if "prompt" in data:
-    #         inputs["prompt"] = data["prompt"]
-
-    #     return inputs
 
 @dataclasses.dataclass(frozen=True)
 class AlohaOutputs(transforms.DataTransformFn):
@@ -141,11 +114,10 @@ class AlohaOutputs(transforms.DataTransformFn):
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
-
+    action_horizon: int = 17
     def __call__(self, data: dict) -> dict:
         # Only return the first 14 dims.
-        actions = np.asarray(data["actions"][:, :14])  # Aloha/Songling
-        # actions = np.asarray(data["actions"][:, :16])  # G1
+        actions = np.asarray(data["actions"][:, :self.action_horizon])
         return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
 
 
@@ -218,54 +190,45 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
         # Convert from [channel, height, width] to [height, width, channel].
         return einops.rearrange(img, "c h w -> h w c")
 
-    images = data["images"]
-    images_dict = {name: convert_image(img) for name, img in images.items()}
+    if "images" in data:
+        images = data["images"]
+        images_dict = {name: convert_image(img) for name, img in images.items()}
+        data["images"] = images_dict
 
-    data["images"] = images_dict
     data["state"] = state
     return data
-# 计算norm用
-# def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
-#     # state is [left_arm_joint_angles, left_arm_gripper, right_arm_joint_angles, right_arm_gripper]
-#     # dim sizes: [6, 1, 6, 1]
-#     state = np.asarray(data["state"])
-#     state = _decode_state(state, adapt_to_pi=adapt_to_pi)
 
-#     def convert_image(img):
-#         img = np.asarray(img)
-#         # Convert to uint8 if using float images.
-#         if np.issubdtype(img.dtype, np.floating):
-#             img = (255 * img).astype(np.uint8)
-#         # Convert from [channel, height, width] to [height, width, channel].
-#         return einops.rearrange(img, "c h w -> h w c")
-    
-#     if "images" in data:
-#         images = data["images"]
-#         images_dict = {name: convert_image(img) for name, img in images.items()}
-
-#         data["images"] = images_dict
-#     data["state"] = state
-#     return data
 
 def _decode_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
     if adapt_to_pi:
-        # Flip the joints.
-        state = _joint_flip_mask() * state
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
-        state[[6, 13]] = _gripper_to_angular(state[[6, 13]])
+        # Apply adapt_to_pi only to the first 14 dims (standard Aloha joint space).
+        # Extra dims beyond 14 (e.g. waist joints) pass through unchanged.
+        front = _joint_flip_mask() * state[..., :14]
+        front[[6, 13]] = _gripper_to_angular(front[[6, 13]])
+        if state.shape[-1] > 14:
+            state = np.concatenate([front, state[..., 14:]], axis=-1)
+        else:
+            state = front
     return state
 
 
 def _encode_actions(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
     if adapt_to_pi:
-        # Flip the joints.
-        actions = _joint_flip_mask() * actions
-        actions[:, [6, 13]] = _gripper_from_angular(actions[:, [6, 13]])
+        front = _joint_flip_mask() * actions[..., :14]
+        front[..., [6, 13]] = _gripper_from_angular(front[..., [6, 13]])
+        if actions.shape[-1] > 14:
+            actions = np.concatenate([front, actions[..., 14:]], axis=-1)
+        else:
+            actions = front
     return actions
 
 
 def _encode_actions_inv(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
     if adapt_to_pi:
-        actions = _joint_flip_mask() * actions
-        actions[:, [6, 13]] = _gripper_from_angular_inv(actions[:, [6, 13]])
+        front = _joint_flip_mask() * actions[..., :14]
+        front[..., [6, 13]] = _gripper_from_angular_inv(front[..., [6, 13]])
+        if actions.shape[-1] > 14:
+            actions = np.concatenate([front, actions[..., 14:]], axis=-1)
+        else:
+            actions = front
     return actions
