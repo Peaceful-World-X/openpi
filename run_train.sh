@@ -7,7 +7,7 @@ export WANDB_DIR=/shared_disk/users/can.jin/wandb
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
-config_name=pi05_fast_2_carry_subbox_b1_0509_merged
+config_name=pi05_benchmark_open_water_0501_add_move_base
 date_str=$(date +%Y%m%d)
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --offline scripts/train.py \
     ${config_name} \

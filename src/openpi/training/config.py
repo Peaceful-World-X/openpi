@@ -827,7 +827,7 @@ _CONFIGS = [
     #
     # Personal Config for compute norm.
     #
-    # aloha_piper config
+    # agilex piper config
     TrainConfig(
         # 任务名
         name="pi05_benchmark_open_water_0501",
@@ -863,6 +863,51 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             action_horizon=14,
             mask_list=[6, -1, 6, -1],
+            zero_mask_list=[-14, 18],
+            adapt_to_pi=True, # Aloha/Songling
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+    ),
+    # agilex aloha config
+    TrainConfig(
+        # 任务名
+        name="pi05_benchmark_open_water_0501_add_move_base",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 加载多数据路径
+            repo_id='/shared_disk/users/can.jin/dataset/agilex/benchmark_open_water_0501/260501190118_4464',
+            assets=AssetsConfig(
+                # 加载norm路径
+                assets_dir="/mnt/pfs/users/can.jin/public/norm_stats/assets",
+                asset_id="benchmark_open_water_0501_add_move_base",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            # base_config=DataConfig(
+            #     local_files_only=True,  # Set to True for local-only datasets.
+            # ),
+            use_delta_joint_actions=True,
+            action_horizon=16,
+            mask_list=[6, -1, 6, -1, 2],
+            zero_mask_list=[-16, 16],
             adapt_to_pi=True, # Aloha/Songling
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
