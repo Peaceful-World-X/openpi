@@ -6,6 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
+import os
 from typing import Any, Literal, Protocol, TypeAlias, Union, List
 
 import etils.epath as epath
@@ -32,6 +33,7 @@ ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
 
+import openpi.policies.ebench_teleop_policy as ebench_teleop_policy
 
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
@@ -550,6 +552,91 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+
+def _discover_lerobot_repo_ids(
+    root: str = "/shared_disk/users/wenyao.xue/EBench-Dataset",
+    subset: str | None = None,
+) -> list[str]:
+    """Auto-discover local LeRobot dataset directories.
+
+    A valid LeRobot dataset directory contains meta/info.json.
+    By default this scans the full EBench root, i.e. all 26 tasks.
+    Set EBENCH_DATA_SUBSET=teleop_tasks only when you intentionally want the 7 teleop tasks.
+    """
+    root_path = pathlib.Path(os.environ.get("EBENCH_DATA_ROOT", root)).resolve()
+    subset = os.environ.get("EBENCH_DATA_SUBSET", subset)
+
+    search_root = root_path / subset if subset else root_path
+    if not search_root.exists():
+        raise FileNotFoundError(f"EBench search root does not exist: {search_root}")
+
+    repo_ids = sorted({str(p.parent.parent.resolve()) for p in search_root.rglob("meta/info.json")})
+    if not repo_ids:
+        raise FileNotFoundError(f"No LeRobot datasets found under: {search_root}")
+
+    print(f"[INFO] Discovered {len(repo_ids)} EBench LeRobot datasets under {search_root}")
+    for repo_id in repo_ids:
+        print(f"[INFO]   {repo_id}")
+    return repo_ids
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotEBenchTeleopDataConfig(DataConfigFactory):
+    repo_id: list[str] | str = tyro.MISSING
+
+    assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
+    base_config: tyro.conf.Suppress[DataConfig | None] = None
+
+    default_prompt: str | None = None
+    use_delta_joint_actions: bool = True
+    use_base: bool = True
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                ebench_teleop_policy.EBenchTeleopInputs(use_base=self.use_base),
+            ],
+            outputs=[
+                ebench_teleop_policy.EBenchTeleopOutputs(use_base=self.use_base),
+            ],
+        )
+
+        data_transforms = _transforms.Group()
+
+        if self.use_delta_joint_actions:
+            if self.use_base:
+                # 19-dim action/state:
+                #   0:12  arm joints        absolute target -> delta relative to state
+                #   12:16 grippers          keep absolute
+                #   16:19 mobile base delta keep as-is because it is already delta
+                delta_action_mask = _transforms.make_bool_mask(12, -7)
+            else:
+                # 16-dim action/state:
+                #   0:12  arm joints -> delta
+                #   12:16 grippers   -> absolute
+                delta_action_mask = _transforms.make_bool_mask(12, -4)
+
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        action_sequence_keys = (
+            ("action.joints", "action.gripper", "action.base_delta")
+            if self.use_base
+            else ("action.joints", "action.gripper")
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=action_sequence_keys,
+        )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1104,7 +1191,6 @@ _CONFIGS = [
         # 训练结果存放位置
         checkpoint_base_dir = "/shared_disk/users/can.jin/model/openpi",
     ),
-   
     #
     # Fine-tuning DROID configs.
     #
@@ -1251,7 +1337,43 @@ _CONFIGS = [
     # RoboArena configs.
     #
     *roboarena_config.get_roboarena_configs(),
+
+    #
+    # PI05 EBench task26, 3-view, 19-dim base state/action.
+    #
+    TrainConfig(
+        name="pi05_ebench_task26",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+        ),
+        data=LeRobotEBenchTeleopDataConfig(
+            repo_id=_discover_lerobot_repo_ids(
+                root="/shared_disk/users/wenyao.xue/EBench-Dataset",
+                subset=None,
+            ),
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_ebench_task26",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=True,
+            use_base=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=64,
+        log_interval=100,
+        save_interval=5000,
+        keep_period=10_000,
+    ),
 ]
+
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

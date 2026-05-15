@@ -6,6 +6,19 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH
 
+assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets"
+asset_id="pi05_ebench_task26"
+
+uv run --no-sync python -u scripts/compute_norm_stats_fast.py \
+  --data-root /shared_disk/users/wenyao.xue/EBench-Dataset \
+  --output-path "${assets_dir}/${asset_id}" \
+  --action-horizon 20 \
+  --action-dim 32 \
+  --use-base \
+  --use-delta-joint-actions \
+  --num-workers 64
+
+
 # # # songling piper state dim 14 action dim 16
 # uv run scripts/compute_norm_stats_fast.py \
 #     --data-path /shared_disk/users/can.jin/dataset/agilex/benchmark_open_water_0501/260501190118_4464  \
