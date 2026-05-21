@@ -7,6 +7,26 @@ export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH
 
 assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets"
+asset_id="pi05_robocasa_task300"
+
+# Smoke_Test
+# uv run --no-sync python -u scripts/compute_norm_stats_fast.py \
+#   --data-path /shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain/atomic/AdjustToasterOvenTemperature/20250820/lerobot \
+#   --output-path "${assets_dir}/${asset_id}" \
+#   --action-horizon 16 \
+#   --action-dim 32 \
+#   --num-workers 64
+
+uv run --no-sync python -u scripts/compute_norm_stats_fast.py \
+  --data-root /shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain \
+  --output-path "${assets_dir}/${asset_id}" \
+  --action-horizon 16 \
+  --action-dim 32 \
+  --num-workers 64
+
+
+# ******************************************************************
+assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets"
 asset_id="pi05_ebench_task26"
 
 uv run --no-sync python -u scripts/compute_norm_stats_fast.py \
@@ -18,6 +38,7 @@ uv run --no-sync python -u scripts/compute_norm_stats_fast.py \
   --use-delta-joint-actions \
   --num-workers 64
 
+# ******************************************************************
 
 # # # songling piper state dim 14 action dim 16
 # uv run scripts/compute_norm_stats_fast.py \

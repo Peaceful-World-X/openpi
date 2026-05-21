@@ -34,6 +34,7 @@ ModelType: TypeAlias = _model.ModelType
 Filter: TypeAlias = nnx.filterlib.Filter
 
 import openpi.policies.ebench_teleop_policy as ebench_teleop_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
@@ -555,7 +556,7 @@ class TrainConfig:
 
 
 def _discover_lerobot_repo_ids(
-    root: str = "/shared_disk/users/wenyao.xue/EBench-Dataset",
+    root: str = "/shared_disk/users/wenyao.xue/datasets/EBench-Dataset",
     subset: str | None = None,
 ) -> list[str]:
     """Auto-discover local LeRobot dataset directories.
@@ -576,8 +577,6 @@ def _discover_lerobot_repo_ids(
         raise FileNotFoundError(f"No LeRobot datasets found under: {search_root}")
 
     print(f"[INFO] Discovered {len(repo_ids)} EBench LeRobot datasets under {search_root}")
-    for repo_id in repo_ids:
-        print(f"[INFO]   {repo_id}")
     return repo_ids
 
 
@@ -593,6 +592,9 @@ class LeRobotEBenchTeleopDataConfig(DataConfigFactory):
     use_base: bool = True
 
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.repo_id == "auto":
+            object.__setattr__(self, "repo_id", _discover_lerobot_repo_ids())
+
         repack_transform = _transforms.Group(
             inputs=[
                 ebench_teleop_policy.EBenchTeleopInputs(use_base=self.use_base),
@@ -636,6 +638,97 @@ class LeRobotEBenchTeleopDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRobocasaDataConfig(DataConfigFactory):
+    repo_id: list[str] | str = tyro.MISSING
+
+    assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
+    base_config: tyro.conf.Suppress[DataConfig | None] = None
+
+    modality_json_path: str | None = None
+    default_prompt: str | None = None
+    use_delta_actions: bool = False
+    delta_action_mask_list: list[int] | None = None
+
+    base_camera_key: str | None = None
+    left_camera_key: str | None = None
+    right_camera_key: str | None = None
+    annotation_key: str | None = None
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # RoboCasa-only fast path.
+        # Expected layout:
+        #   /shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain/
+        #     atomic/<task>/<date>/lerobot/meta/{info.json,modality.json}
+        #     composite/<task>/<date>/lerobot/meta/{info.json,modality.json}
+        repo_id = self.repo_id
+        if repo_id == "auto":
+            root = pathlib.Path("/shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain")
+            repos: list[str] = []
+            for pattern in ("atomic/*/*/lerobot", "composite/*/*/lerobot"):
+                for repo in root.glob(pattern):
+                    if (repo / "meta" / "info.json").is_file() and (repo / "meta" / "modality.json").is_file():
+                        repos.append(str(repo))
+            repo_id = sorted(repos)
+            if not repo_id:
+                raise FileNotFoundError(f"No RoboCasa LeRobot repos found under {root}")
+            object.__setattr__(self, "repo_id", repo_id)
+
+        repo_ids = [repo_id] if isinstance(repo_id, str) else list(repo_id)
+        if not repo_ids:
+            raise ValueError("repo_id must contain at least one RoboCasa LeRobot repo")
+
+        modality_json_path = self.modality_json_path
+        if modality_json_path is None and repo_ids != ["fake"]:
+            modality_path = pathlib.Path(repo_ids[0]) / "meta" / "modality.json"
+            if not modality_path.is_file():
+                raise FileNotFoundError(f"Missing RoboCasa modality metadata: {modality_path}")
+            modality_json_path = str(modality_path)
+
+        if modality_json_path is None:
+            repack_transform = _transforms.Group()
+        else:
+            repack_transform = _transforms.Group(
+                inputs=[
+                    robocasa_policy.RobocasaInputs(
+                        modality_path=modality_json_path,
+                        base_camera_key=self.base_camera_key,
+                        left_camera_key=self.left_camera_key,
+                        right_camera_key=self.right_camera_key,
+                        annotation_key=self.annotation_key,
+                    ),
+                ],
+                outputs=[
+                    robocasa_policy.RobocasaOutputs(
+                        modality_path=modality_json_path,
+                    ),
+                ],
+            )
+
+        data_transforms = _transforms.Group()
+        if self.use_delta_actions:
+            if not self.delta_action_mask_list:
+                raise ValueError("delta_action_mask_list must be set when use_delta_actions is True")
+            delta_action_mask = _transforms.make_bool_mask(*self.delta_action_mask_list)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repo_id=repo_ids,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -1349,10 +1442,7 @@ _CONFIGS = [
             discrete_state_input=False,
         ),
         data=LeRobotEBenchTeleopDataConfig(
-            repo_id=_discover_lerobot_repo_ids(
-                root="/shared_disk/users/wenyao.xue/EBench-Dataset",
-                subset=None,
-            ),
+            repo_id="auto",
             assets=AssetsConfig(
                 assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
                 asset_id="pi05_ebench_task26",
@@ -1372,6 +1462,38 @@ _CONFIGS = [
         save_interval=5000,
         keep_period=10_000,
     ),
+
+    #
+    # PI05 Robocasa, modality.json-based LeRobot datasets.
+    #
+    TrainConfig(
+        name="pi05_robocasa_task300",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=16,
+            discrete_state_input=False,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            repo_id="auto",
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_robocasa_task300",
+            ),
+            base_config=DataConfig(prompt_from_task=False),
+            use_delta_actions=False,  # modality.json actions are mixed command signals (base_motion, control_mode, ee deltas, gripper); do not delta against state
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=32,
+        log_interval=100,
+        save_interval=5000,
+        keep_period=10_000,
+    ),
+
 ]
 
 

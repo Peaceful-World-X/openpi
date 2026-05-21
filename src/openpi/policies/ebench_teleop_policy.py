@@ -29,6 +29,13 @@ def _check_last_dim(name, x, expected):
     return x
 
 
+def _get_first(data, *keys):
+    for key in keys:
+        if key in data:
+            return data[key]
+    raise KeyError(keys[0])
+
+
 @dataclasses.dataclass(frozen=True)
 class EBenchTeleopInputs:
     # 19-dim state/action:
@@ -42,27 +49,45 @@ class EBenchTeleopInputs:
     top_camera_fallback_key: str = "video.top_camera_view"
 
     def __call__(self, data):
-        state_joints = _check_last_dim("state.joints", _to_numpy(data["state.joints"]).astype(np.float32), 12)
-        state_gripper = _check_last_dim("state.gripper", _to_numpy(data["state.gripper"]).astype(np.float32), 4)
-        action_joints = _check_last_dim("action.joints", _to_numpy(data["action.joints"]).astype(np.float32), 12)
-        action_gripper = _check_last_dim("action.gripper", _to_numpy(data["action.gripper"]).astype(np.float32), 4)
+        state_joints = _check_last_dim(
+            "state.joints", _to_numpy(_get_first(data, "state.joints", "states/joint")).astype(np.float32), 12
+        )
+        state_gripper = _check_last_dim(
+            "state.gripper", _to_numpy(_get_first(data, "state.gripper", "states/gripper")).astype(np.float32), 4
+        )
 
         state_parts = [state_joints, state_gripper]
-        action_parts = [action_joints, action_gripper]
+        action_parts = None
+
+        has_actions = "action.joints" in data or "actions/joint" in data
+        if has_actions:
+            action_joints = _check_last_dim(
+                "action.joints", _to_numpy(_get_first(data, "action.joints", "actions/joint")).astype(np.float32), 12
+            )
+            action_gripper = _check_last_dim(
+                "action.gripper", _to_numpy(_get_first(data, "action.gripper", "actions/gripper")).astype(np.float32), 4
+            )
+            action_parts = [action_joints, action_gripper]
 
         if self.use_base:
             state_base = _check_last_dim("state.base", _to_numpy(data["state.base"]).astype(np.float32), 3)
-            action_base_delta = _check_last_dim("action.base_delta", _to_numpy(data["action.base_delta"]).astype(np.float32), 3)
             state_parts.append(state_base)
-            action_parts.append(action_base_delta)
+            if has_actions:
+                action_base_delta = _check_last_dim(
+                    "action.base_delta",
+                    _to_numpy(_get_first(data, "action.base_delta", "actions/base")).astype(np.float32),
+                    3,
+                )
+                action_parts.append(action_base_delta)
 
         state = np.concatenate(state_parts, axis=-1).astype(np.float32)
-        actions = np.concatenate(action_parts, axis=-1).astype(np.float32)
 
         image = {
-            "base_0_rgb": _image_to_numpy_hwc(data[self.overlook_camera_key]),
-            "left_wrist_0_rgb": _image_to_numpy_hwc(data[self.left_camera_key]),
-            "right_wrist_0_rgb": _image_to_numpy_hwc(data[self.right_camera_key]),
+            "base_0_rgb": _image_to_numpy_hwc(
+                _get_first(data, self.overlook_camera_key, self.top_camera_fallback_key, "images/head")
+            ),
+            "left_wrist_0_rgb": _image_to_numpy_hwc(_get_first(data, self.left_camera_key, "images/hand_left")),
+            "right_wrist_0_rgb": _image_to_numpy_hwc(_get_first(data, self.right_camera_key, "images/hand_right")),
         }
 
         # OpenPI Observation.from_dict 需要 image_mask。
@@ -78,8 +103,9 @@ class EBenchTeleopInputs:
             "image": image,
             "image_mask": image_mask,
             "state": state,
-            "actions": actions,
         }
+        if action_parts is not None:
+            result["actions"] = np.concatenate(action_parts, axis=-1).astype(np.float32)
 
         prompt = data.get("prompt", data.get("task", None))
         if prompt is not None:

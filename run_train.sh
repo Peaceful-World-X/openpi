@@ -13,18 +13,24 @@ export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
-
-export PROJECT_ROOT=/mnt/pfs/users/wenyao.xue/code/GigaBrain-OpenPI05
-export EBENCH_DATA_ROOT=/shared_disk/users/wenyao.xue/EBench-Dataset
-
-config_name=pi05_ebench_task26
+export JAX_PLATFORMS=cuda
 date_str=$(date +%Y%m%d)
+
+# config_name=pi05_ebench_task26
+config_name="pi05_robocasa_task300"
+
 
 # Smoke_Test
 # XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --no-sync --offline scripts/train.py \
 #   ${config_name} \
 #   --exp-name "${date_str}_${config_name}_Smoke" \
-#   --data.repo-id /shared_disk/users/wenyao.xue/EBench-Dataset/simple_pnp/task1 \
+#   --data.repo-id /shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain/atomic/AdjustToasterOvenTemperature/20250820/lerobot \
+#   --batch-size 128 \
+#   --num-workers 32 \
+#   --num-train-steps 100_000 \
+#   --save-interval 1000 \
+#   --keep-period 10_000 \
+#   --fsdp-devices 4 \
 #   --overwrite
 
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --no-sync --offline scripts/train.py \
