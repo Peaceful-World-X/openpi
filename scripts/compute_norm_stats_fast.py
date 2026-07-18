@@ -253,8 +253,9 @@ def _process_single_parquet(
 # ---------------------------------------------------------------------------
 
 def main(
-    data_path: str,
     output_path: str,
+    data_path: str | None = None,
+    data_paths: list[str] | None = None,
     action_horizon: int = 50,
     action_dim: int = 32,
     mask_list: list[int] | None = None,
@@ -265,7 +266,8 @@ def main(
     """Compute norm stats directly from parquet files.
 
     Args:
-        data_path: Path to LeRobot dataset directory.
+        data_path: Path to one LeRobot dataset directory.
+        data_paths: Paths to multiple LeRobot dataset directories.
         output_path: Directory to write norm_stats.json into.
         action_horizon: Number of future action frames per window.
         action_dim: Padding dimension for state and actions.
@@ -277,11 +279,19 @@ def main(
     delta_mask = _make_bool_mask(*mask_list) if mask_list else None
     zero_mask = _make_bool_mask(*zero_mask_list) if zero_mask_list else None
 
-    parquet_files = _collect_parquet_files([data_path])
-    if not parquet_files:
-        raise FileNotFoundError(f"No parquet files found under {data_path}")
+    selected_data_paths = []
+    if data_path is not None:
+        selected_data_paths.append(data_path)
+    if data_paths is not None:
+        selected_data_paths.extend(data_paths)
+    if not selected_data_paths:
+        raise ValueError("Provide --data-path or --data-paths")
 
-    print(f"Found {len(parquet_files)} parquet files")
+    parquet_files = _collect_parquet_files(selected_data_paths)
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found under {selected_data_paths}")
+
+    print(f"Found {len(parquet_files)} parquet files from {len(selected_data_paths)} data path(s)")
     print(f"action_horizon={action_horizon}, action_dim={action_dim}, num_workers={num_workers}")
 
     keys = ["state", "actions"]

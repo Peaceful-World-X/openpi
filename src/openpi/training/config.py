@@ -1,16 +1,19 @@
 """See _CONFIGS for the list of available configs."""
 
 import abc
+import json
 from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
 import pathlib
 import os
+import sys
 from typing import Any, Literal, Protocol, TypeAlias, Union, List
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -35,6 +38,118 @@ Filter: TypeAlias = nnx.filterlib.Filter
 
 import openpi.policies.ebench_teleop_policy as ebench_teleop_policy
 import openpi.policies.robocasa_policy as robocasa_policy
+import openpi.policies.ebench_policy as ebench_policy
+import openpi.policies.ebench_fixedbase_policy as ebench_fixedbase_policy
+
+
+@dataclasses.dataclass(frozen=True)
+class _LazyDatasetSoup:
+    name: str
+
+
+def _dataset_soup(name: str) -> _LazyDatasetSoup:
+    return _LazyDatasetSoup(name)
+
+
+def _ensure_workspace_robocasa_on_path() -> None:
+    workspace_root = pathlib.Path(__file__).resolve().parents[4]
+    robocasa_src = workspace_root / "Robocasa" / "robocasa"
+    if robocasa_src.is_dir() and str(robocasa_src) not in sys.path:
+        sys.path.insert(0, str(robocasa_src))
+
+
+def _load_robocasa_dataset_soup_registry() -> dict[str, Any]:
+    try:
+        from robocasa.utils.dataset_registry import DATASET_SOUP_REGISTRY  # type: ignore
+    except ModuleNotFoundError:
+        _ensure_workspace_robocasa_on_path()
+        try:
+            from robocasa.utils.dataset_registry import DATASET_SOUP_REGISTRY  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "robocasa is required for official RoboCasa data-soup configs such as "
+                "pi05_pretrain_human300. Install it with `pip install -e "
+                "/mnt/pfs/users/wenyao.xue/code/Robocasa/robocasa` or make it importable."
+            ) from exc
+    return DATASET_SOUP_REGISTRY
+
+
+def _local_robocasa_pretrain_human300_soup() -> list[dict[str, Any]]:
+    root = pathlib.Path("/shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain")
+    data_dirs = [
+        {"path": str(repo), "filter_key": "100_demos"}
+        for pattern in ("atomic/*/*/lerobot", "composite/*/*/lerobot")
+        for repo in root.glob(pattern)
+        if (repo / "meta" / "info.json").is_file() and (repo / "meta" / "modality.json").is_file()
+    ]
+    if not data_dirs:
+        raise FileNotFoundError(f"No RoboCasa LeRobot repos found under {root}")
+    return sorted(data_dirs, key=lambda item: item["path"])
+
+
+def _resolve_dataset_soup(data_dirs: Any | None) -> Any | None:
+    if not isinstance(data_dirs, _LazyDatasetSoup):
+        return data_dirs
+
+    if data_dirs.name == "pretrain_human300":
+        return _local_robocasa_pretrain_human300_soup()
+
+    registry = _load_robocasa_dataset_soup_registry()
+    if data_dirs.name not in registry:
+        raise KeyError(f"RoboCasa DATASET_SOUP_REGISTRY[{data_dirs.name!r}] is unavailable.")
+    return registry[data_dirs.name]
+
+
+def _robocasa_data_dirs_to_repo_ids(data_dirs: Any) -> list[str]:
+    if isinstance(data_dirs, (str, pathlib.Path)):
+        items = [data_dirs]
+    else:
+        items = list(data_dirs)
+
+    repo_ids: list[str] = []
+    missing: list[str] = []
+    for item in items:
+        path = item.get("path") if isinstance(item, dict) else item
+        if path is None:
+            continue
+        repo = pathlib.Path(path)
+        if (repo / "meta" / "info.json").is_file():
+            repo_ids.append(str(repo))
+        else:
+            missing.append(str(repo))
+
+    if missing:
+        sample = ", ".join(missing[:5])
+        raise FileNotFoundError(f"Missing RoboCasa LeRobot repo metadata for {len(missing)} path(s): {sample}")
+    if not repo_ids:
+        raise ValueError("Could not resolve any LeRobot repo paths from RoboCasa data_dirs")
+    return repo_ids
+
+
+def _robocasa_stats_entry_to_norm_stats(entry: dict[str, Any]) -> _normalize.NormStats:
+    return _normalize.NormStats(
+        mean=np.asarray(entry["mean"]),
+        std=np.asarray(entry["std"]),
+        q01=np.asarray(entry["q01"]) if entry.get("q01") is not None else None,
+        q99=np.asarray(entry["q99"]) if entry.get("q99") is not None else None,
+    )
+
+
+def _load_robocasa_repo_norm_stats(repo_ids: Sequence[str]) -> dict[str, _normalize.NormStats] | None:
+    for repo_id in repo_ids:
+        stats_path = pathlib.Path(repo_id) / "meta" / "stats.json"
+        if not stats_path.is_file():
+            continue
+        stats = json.loads(stats_path.read_text())
+        if "observation.state" not in stats or "action" not in stats:
+            continue
+        logging.info(f"Loaded RoboCasa fallback norm stats from {stats_path}")
+        return {
+            "state": _robocasa_stats_entry_to_norm_stats(stats["observation.state"]),
+            "actions": _robocasa_stats_entry_to_norm_stats(stats["action"]),
+        }
+    return None
+
 
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
@@ -101,6 +216,12 @@ class DataConfig:
 
     # If true, will disable syncing the dataset from the Hugging Face Hub. Allows training on local-only datasets.
     local_files_only: bool = False
+
+    # Official RoboCasa/OpenPI-style dataset mixture metadata. The local LeRobot
+    # data loader still consumes repo_id; this is preserved on DataConfig so
+    # RoboCasa configs can mirror the official data_dirs interface.
+    data_dirs: Any | None = None
+    dataset_weights: list[float] | None = None
 
 
 class GroupFactory(Protocol):
@@ -227,6 +348,169 @@ class SimpleDataConfig(DataConfigFactory):
             self.create_base_config(assets_dirs, model_config),
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotEBenchFixedBaseDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
+    comments below.
+    """
+
+    extra_delta_transform: bool = False
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform is *only* applied to the data coming from the dataset,
+        # and *not* during inference. We can use it to make inputs from the dataset look
+        # as close as possible to those coming from the inference environment (e.g. match the keys).
+        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
+        # the keys we use in our inference pipeline (defined in the inference script for libero).
+        # For your own dataset, first figure out what keys your environment passes to the policy server
+        # and then modify the mappings below so your dataset's keys get matched to those target keys.
+        # The repack transform simply remaps key names here.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images/head": "video.overlook_camera_view",
+                        "images/hand_left": "video.left_camera_view",
+                        "images/hand_right": "video.right_camera_view",
+                        "states/joint": "state.joints",
+                        "states/gripper": "state.gripper",
+                        "actions/joint": "action.joints",
+                        "actions/gripper": "action.gripper",
+                        "prompt": "prompt",
+                        
+                    }
+                )
+            ]
+        )
+
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
+        # for data coming out of the model (``outputs``) (the latter is only used during inference).
+        # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
+        # how to modify the transforms to match your dataset. Once you created your own transforms, you can
+        # replace the transforms below with your own.
+        data_transforms = _transforms.Group(
+            inputs=[ebench_fixedbase_policy.EBenchInputs(model_type=model_config.model_type)],
+            outputs=[ebench_fixedbase_policy.EBenchOutputs()],
+        )
+
+        # One additional data transform: pi0 models are trained on delta actions (relative to the first
+        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
+        # you can uncomment the following line to convert the actions to delta actions. The only exception
+        # is for the gripper actions which are always absolute.
+        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
+        # leave the 7th action (gripper) unchanged, i.e. absolute.
+        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
+        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
+        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(12, -4) 
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotEBenchDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
+    comments below.
+    """
+
+    extra_delta_transform: bool = False
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform is *only* applied to the data coming from the dataset,
+        # and *not* during inference. We can use it to make inputs from the dataset look
+        # as close as possible to those coming from the inference environment (e.g. match the keys).
+        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
+        # the keys we use in our inference pipeline (defined in the inference script for libero).
+        # For your own dataset, first figure out what keys your environment passes to the policy server
+        # and then modify the mappings below so your dataset's keys get matched to those target keys.
+        # The repack transform simply remaps key names here.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images/head": "video.overlook_camera_view",
+                        "images/hand_left": "video.left_camera_view",
+                        "images/hand_right": "video.right_camera_view",
+                        "states/joint": "state.joints",
+                        "states/gripper": "state.gripper",
+                        "actions/joint": "action.joints",
+                        "actions/gripper": "action.gripper",
+                        "actions/base": "action.base",
+                        "prompt": "prompt",
+                        
+                    }
+                )
+            ]
+        )
+
+
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
+        # for data coming out of the model (``outputs``) (the latter is only used during inference).
+        # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
+        # how to modify the transforms to match your dataset. Once you created your own transforms, you can
+        # replace the transforms below with your own.
+        data_transforms = _transforms.Group(
+            inputs=[ebench_policy.EBenchInputs(model_type=model_config.model_type)],
+            outputs=[ebench_policy.EBenchOutputs()],
+        )
+
+        # One additional data transform: pi0 models are trained on delta actions (relative to the first
+        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
+        # you can uncomment the following line to convert the actions to delta actions. The only exception
+        # is for the gripper actions which are always absolute.
+        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
+        # leave the 7th action (gripper) unchanged, i.e. absolute.
+        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
+        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
+        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
+
+       
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(12, -4) 
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -556,7 +840,7 @@ class TrainConfig:
 
 
 def _discover_lerobot_repo_ids(
-    root: str = "/shared_disk/users/wenyao.xue/datasets/EBench-Dataset",
+    root: str = "/shared_disk/users/wenyao.xue/data/EBench-Dataset",
     subset: str | None = None,
 ) -> list[str]:
     """Auto-discover local LeRobot dataset directories.
@@ -595,16 +879,26 @@ class LeRobotEBenchTeleopDataConfig(DataConfigFactory):
         if self.repo_id == "auto":
             object.__setattr__(self, "repo_id", _discover_lerobot_repo_ids())
 
-        repack_transform = _transforms.Group(
-            inputs=[
-                ebench_teleop_policy.EBenchTeleopInputs(use_base=self.use_base),
-            ],
-            outputs=[
-                ebench_teleop_policy.EBenchTeleopOutputs(use_base=self.use_base),
-            ],
-        )
+        serving = self.repo_id == "fake"
+        repack_transform = _transforms.Group()
+        if not serving:
+            repack_transform = _transforms.Group(
+                inputs=[
+                    ebench_teleop_policy.EBenchTeleopInputs(use_base=self.use_base),
+                ],
+                outputs=[
+                    ebench_teleop_policy.EBenchTeleopOutputs(use_base=self.use_base),
+                ],
+            )
 
-        data_transforms = _transforms.Group()
+        data_transforms = (
+            _transforms.Group(
+                inputs=[ebench_teleop_policy.EBenchTeleopInputs(use_base=self.use_base)],
+                outputs=[ebench_teleop_policy.EBenchTeleopOutputs(use_base=self.use_base)],
+            )
+            if serving
+            else _transforms.Group()
+        )
 
         if self.use_delta_joint_actions:
             if self.use_base:
@@ -643,92 +937,59 @@ class LeRobotEBenchTeleopDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotRobocasaDataConfig(DataConfigFactory):
-    repo_id: list[str] | str = tyro.MISSING
+    """Official RoboCasa/Groot-style data config."""
 
-    assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
-    base_config: tyro.conf.Suppress[DataConfig | None] = None
+    repo_id: str | None = None
+    data_dirs: Any | None = None
+    dataset_weights: list[float] | None = None
 
-    modality_json_path: str | None = None
-    default_prompt: str | None = None
-    use_delta_actions: bool = False
-    delta_action_mask_list: list[int] | None = None
+    action_dim: int | None = None
 
-    base_camera_key: str | None = None
-    left_camera_key: str | None = None
-    right_camera_key: str | None = None
-    annotation_key: str | None = None
-
-    action_sequence_keys: Sequence[str] = ("action",)
-
+    @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # RoboCasa-only fast path.
-        # Expected layout:
-        #   /shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain/
-        #     atomic/<task>/<date>/lerobot/meta/{info.json,modality.json}
-        #     composite/<task>/<date>/lerobot/meta/{info.json,modality.json}
         repo_id = self.repo_id
+        data_dirs = _resolve_dataset_soup(self.data_dirs)
+
         if repo_id == "auto":
-            root = pathlib.Path("/shared_disk/users/hengtao.li/robocasa_datasets/v1.0/pretrain")
-            repos: list[str] = []
-            for pattern in ("atomic/*/*/lerobot", "composite/*/*/lerobot"):
-                for repo in root.glob(pattern):
-                    if (repo / "meta" / "info.json").is_file() and (repo / "meta" / "modality.json").is_file():
-                        repos.append(str(repo))
-            repo_id = sorted(repos)
-            if not repo_id:
-                raise FileNotFoundError(f"No RoboCasa LeRobot repos found under {root}")
-            object.__setattr__(self, "repo_id", repo_id)
+            data_dirs = _dataset_soup("pretrain_human300")
+            data_dirs = _resolve_dataset_soup(data_dirs)
+            repo_id = None
 
-        repo_ids = [repo_id] if isinstance(repo_id, str) else list(repo_id)
-        if not repo_ids:
-            raise ValueError("repo_id must contain at least one RoboCasa LeRobot repo")
+        repo_ids = _robocasa_data_dirs_to_repo_ids(data_dirs) if data_dirs else repo_id
+        base = self.create_base_config(assets_dirs, model_config)
+        repo_id_list = [repo_ids] if isinstance(repo_ids, str) else list(repo_ids or [])
 
-        modality_json_path = self.modality_json_path
-        if modality_json_path is None and repo_ids != ["fake"]:
-            modality_path = pathlib.Path(repo_ids[0]) / "meta" / "modality.json"
-            if not modality_path.is_file():
-                raise FileNotFoundError(f"Missing RoboCasa modality metadata: {modality_path}")
-            modality_json_path = str(modality_path)
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.robot0_agentview_left",
+                        "observation/wrist_image": "observation.images.robot0_eye_in_hand",
+                        "observation/right_image": "observation.images.robot0_agentview_right",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
 
-        if modality_json_path is None:
-            repack_transform = _transforms.Group()
-        else:
-            repack_transform = _transforms.Group(
-                inputs=[
-                    robocasa_policy.RobocasaInputs(
-                        modality_path=modality_json_path,
-                        base_camera_key=self.base_camera_key,
-                        left_camera_key=self.left_camera_key,
-                        right_camera_key=self.right_camera_key,
-                        annotation_key=self.annotation_key,
-                    ),
-                ],
-                outputs=[
-                    robocasa_policy.RobocasaOutputs(
-                        modality_path=modality_json_path,
-                    ),
-                ],
-            )
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RobocasaInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[robocasa_policy.RobocasaOutputs()],
+        )
 
-        data_transforms = _transforms.Group()
-        if self.use_delta_actions:
-            if not self.delta_action_mask_list:
-                raise ValueError("delta_action_mask_list must be set when use_delta_actions is True")
-            delta_action_mask = _transforms.make_bool_mask(*self.delta_action_mask_list)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
-
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repo_id=repo_ids,
+            base,
+            repo_id=repo_id_list or repo_ids,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            action_sequence_keys=self.action_sequence_keys,
+            norm_stats=base.norm_stats or _load_robocasa_repo_norm_stats(repo_id_list),
+            data_dirs=data_dirs,
+            dataset_weights=self.dataset_weights,
         )
 
 
@@ -1003,7 +1264,6 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=64,
     ),
-
     #
     # Personal Config for compute norm.
     #
@@ -1284,6 +1544,823 @@ _CONFIGS = [
         # 训练结果存放位置
         checkpoint_base_dir = "/shared_disk/users/can.jin/model/openpi",
     ),
+
+    # ===============================================================================================================================
+    # h01 arm + waist config  /shared_disk/users/wenhao.lu/benchmark_0525/h01/benchmark_language_task_merged
+    TrainConfig(
+        name="pi05_h01_benchmark_language_task_merged",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 记载数据路径
+            repo_id="/shared_disk/users/wenhao.lu/benchmark_0525/h01/benchmark_language_task_merged",
+            assets=AssetsConfig(
+                # 加载norm路径 计算时不用管
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_benchmark_language_task_merged",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist_up": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist_up": "observation.images.cam_right_wrist_up",
+                                "cam_left_wrist_down": "observation.images.cam_left_wrist_down",
+                                "cam_right_wrist_down": "observation.images.cam_right_wrist_down",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # h01 arm + waist config  /shared_disk/users/wenhao.lu/benchmark_0525/h01/benchmark_train_post_task_merged
+    TrainConfig(
+        name="pi05_h01_benchmark_train_post_task_merged",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 记载数据路径
+            repo_id="/shared_disk/users/wenhao.lu/benchmark_0525/h01/benchmark_train_post_task_merged",
+            assets=AssetsConfig(
+                # 加载norm路径 计算时不用管
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_benchmark_train_post_task_merged",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist_up": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist_up": "observation.images.cam_right_wrist_up",
+                                "cam_left_wrist_down": "observation.images.cam_left_wrist_down",
+                                "cam_right_wrist_down": "observation.images.cam_right_wrist_down",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # h01_task002_old  /shared_disk/users/wenhao.lu/benchmark_0525/h01/benchmark2_language_color_push_button
+    TrainConfig(
+        name="pi05_h01_benchmark2_language_color_push_button",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 记载数据路径
+            repo_id="/shared_disk/users/wenhao.lu/benchmark_0525/h01/raw_datasets/benchmark2_language_color_push_button",
+            assets=AssetsConfig(
+                # 加载norm路径 计算时不用管
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_benchmark2_language_color_push_button",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist_up": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist_up": "observation.images.cam_right_wrist_up",
+                                "cam_left_wrist_down": "observation.images.cam_left_wrist_down",
+                                "cam_right_wrist_down": "observation.images.cam_right_wrist_down",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+
+    # 上面训练的5视角有误 ---------------------------------------------------
+    # H01 pound-clay: use the OpenPI model with the same dataset and three cameras as the reference GigaBrain run.
+    TrainConfig(
+        name="pi05_h01_pound_clay_3cam",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/shared_disk/datasets/private_datasets/robot_data/lerobot/COL2607079FE-01_260715060111_5fde16",
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_pound_clay_3cam",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist": "observation.images.cam_right_wrist_up",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=256,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # H01 sort-blocks: mirror the three-camera, arm-only OpenPI setup; match the reference batch size and train steps.
+    TrainConfig(
+        name="pi05_h01_sort_blocks_3cam",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/shared_disk/datasets/private_datasets/robot_data/lerobot/COL26070792F-01_260715223632_4dd226",
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_sort_blocks_3cam",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist": "observation.images.cam_right_wrist_up",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=256,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # pi05_h01_push_button_beside_plate_3cam
+    TrainConfig(
+        name="pi05_h01_push_button_beside_plate_3cam",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotAlohaDataConfig(
+            repo_id=[
+                "/shared_disk/datasets/private_datasets/robot_data/lerobot/COL2607096EF-01_260710150250_1975bc",
+                "/shared_disk/datasets/private_datasets/robot_data/lerobot/COL260709613-01_260712111702_5c9618",
+                "/shared_disk/datasets/private_datasets/robot_data/lerobot/COL2607099C4-01_260712163959_16da02",
+            ],
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_push_button_beside_plate_3cam",
+            ),
+            base_config=DataConfig(prompt_from_task=False),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist": "observation.images.cam_right_wrist_up",
+                            },
+                            "prompt": "task",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=256,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # pi05_h01_push_button_beside_plate_3cam_merge
+    TrainConfig(
+        name="pi05_h01_push_button_beside_plate_3cam_merge",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/shared_disk/users/can.jin/dataset/h01_robot/push_button_20260718",
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_push_button_beside_plate_3cam_merge",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist": "observation.images.cam_right_wrist_up",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=256,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    
+    # ---------------------------------------------------------------------
+    # h01_task001  TODO /shared_disk/benchmark/post_train_val_data/pick_fork_h01
+    TrainConfig(
+        name="pi05_h01_task_001_pick_fork_into_basket",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/shared_disk/benchmark/post_train_val_data/pick_fork_h01",
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_task_001_pick_fork_into_basket",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist": "observation.images.cam_right_wrist_up",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # h01_task002  TODO /mnt/pfs/users/wenyao.xue/code/.shared/data/benchmark/post_train_val_data/push_button_h01_17feat_007
+    TrainConfig(
+        name="pi05_h01_task_002_push_button",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 记载数据路径
+            repo_id="/mnt/pfs/users/wenyao.xue/code/.shared/data/benchmark/post_train_val_data/push_button_h01_17feat_007",
+            assets=AssetsConfig(
+                # 加载norm路径 计算时不用管
+                assets_dir="/mnt/pfs/users/wenyao.xue/code/.shared/results/gigabrain/assets",
+                asset_id="pi05_h01_task_002_push_button",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist": "observation.images.cam_right_wrist_up",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # h01_task002_5view  TODO /mnt/pfs/users/wenyao.xue/code/.shared/data/benchmark/post_train_val_data/push_button_h01_17feat_007
+    TrainConfig(
+        name="pi05_h01_task_002_push_button_5view",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            image_keys=(
+                "base_0_rgb",
+                "left_wrist_1_rgb",
+                "right_wrist_1_rgb",
+                "left_wrist_2_rgb",
+                "right_wrist_2_rgb",
+            ),
+        ),
+        data=LeRobotAlohaDataConfig(
+            # 记载数据路径
+            repo_id="/mnt/pfs/users/wenyao.xue/code/.shared/data/benchmark/post_train_val_data/push_button_h01_17feat_007",
+            assets=AssetsConfig(
+                # 加载norm路径 计算时不用管
+                assets_dir="/mnt/pfs/users/wenyao.xue/code/.shared/results/gigabrain/assets",
+                asset_id="pi05_h01_task_002_push_button",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist_up": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist_up": "observation.images.cam_right_wrist_up",
+                                "cam_left_wrist_down": "observation.images.cam_left_wrist_down",
+                                "cam_right_wrist_down": "observation.images.cam_right_wrist_down",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # h01_task004  TODO /mnt/pfs/users/wenyao.xue/code/.shared/data/benchmark/post_train_data/table_setting_h01
+    TrainConfig(
+        name="pi05_h01_task_004_table_setting",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 记载数据路径
+            repo_id="/mnt/pfs/users/wenyao.xue/code/.shared/data/benchmark/post_train_data/table_setting_h01",
+            assets=AssetsConfig(
+                # 加载norm路径 计算时不用管
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_task_004_table_setting",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist": "observation.images.cam_right_wrist_up",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # h01_task005  TODO /mnt/pfs/users/wenyao.xue/code/.shared/data/benchmark/post_train_data/brush_table_h01
+    TrainConfig(
+        name="pi05_h01_task_005_brush_table",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 记载数据路径
+            repo_id="/mnt/pfs/users/wenyao.xue/code/.shared/data/benchmark/post_train_data/brush_table_h01",
+            assets=AssetsConfig(
+                # 加载norm路径 计算时不用管
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_h01_task_005_brush_table",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "images": {
+                                "cam_high": "observation.images.cam_fisheye_front",
+                                "cam_left_wrist": "observation.images.cam_left_wrist_up",
+                                "cam_right_wrist": "observation.images.cam_right_wrist_up",
+                            },
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            adapt_to_pi=False,
+            action_horizon=16,
+            mask_list=[7, -1, 7, -1],
+            zero_mask_list=[-16, 16],
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+
+
+    # agilex aloha config  benchmark_0525/agilex/benchmark_train_post_task_merged
+    TrainConfig(
+        # 任务名
+        name="pi05_benchmark_train_post_task_merged",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 加载多数据路径
+            repo_id='/shared_disk/users/wenhao.lu/benchmark_0525/agilex/benchmark_train_post_task_merged',
+            assets=AssetsConfig(
+                # 加载norm路径
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_benchmark_train_post_task_merged",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            # base_config=DataConfig(
+            #     local_files_only=True,  # Set to True for local-only datasets.
+            # ),
+            use_delta_joint_actions=True,
+            action_horizon=14,
+            mask_list=[6, -1, 6, -1],
+            zero_mask_list=[-14, 18],
+            adapt_to_pi=True, # Aloha/Songling
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # agilex aloha config  benchmark_0525/agilex/benchmark_language_task_merged
+    TrainConfig(
+        # 任务名
+        name="pi05_benchmark_language_task_merged",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 加载多数据路径
+            repo_id='/shared_disk/users/wenhao.lu/benchmark_0525/agilex/benchmark_language_task_merged',
+            assets=AssetsConfig(
+                # 加载norm路径
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_benchmark_language_task_merged",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            # base_config=DataConfig(
+            #     local_files_only=True,  # Set to True for local-only datasets.
+            # ),
+            use_delta_joint_actions=True,
+            action_horizon=14,
+            mask_list=[6, -1, 6, -1],
+            zero_mask_list=[-14, 18],
+            adapt_to_pi=True, # Aloha/Songling
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # agilex_task001  benchmark_0525/agilex/benchmark2_language_object
+    TrainConfig(
+        # 任务名
+        name="pi05_benchmark2_language_object",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 加载多数据路径
+            repo_id='/shared_disk/users/wenhao.lu/benchmark_0525/agilex/benchmark2_language_object',
+            assets=AssetsConfig(
+                # 加载norm路径
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_benchmark2_language_object",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            # base_config=DataConfig(
+            #     local_files_only=True,  # Set to True for local-only datasets.
+            # ),
+            use_delta_joint_actions=True,
+            action_horizon=14,
+            mask_list=[6, -1, 6, -1],
+            zero_mask_list=[-14, 18],
+            adapt_to_pi=True, # Aloha/Songling
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # agilex_task002  /shared_disk/benchmark/post_train_val_data/push_button
+    TrainConfig(
+        # 任务名
+        name="pi05_post_train_val_data_push_button",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 加载多数据路径
+            repo_id='/shared_disk/benchmark/post_train_val_data/push_button',
+            assets=AssetsConfig(
+                # 加载norm路径
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_post_train_val_data_push_button",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            # base_config=DataConfig(
+            #     local_files_only=True,  # Set to True for local-only datasets.
+            # ),
+            use_delta_joint_actions=True,
+            action_horizon=14,
+            mask_list=[6, -1, 6, -1],
+            zero_mask_list=[-14, 18],
+            adapt_to_pi=True, # Aloha/Songling
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # agilex_task003  /shared_disk/benchmark/post_train_val_data/knead_dough_fix
+    TrainConfig(
+        # 任务名
+        name="pi05_post_train_val_data_knead_dough_fix",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 加载多数据路径
+            repo_id='/shared_disk/benchmark/post_train_val_data/knead_dough_fix',
+            assets=AssetsConfig(
+                # 加载norm路径
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_post_train_val_data_knead_dough_fix",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            action_horizon=14,
+            mask_list=[6, -1, 6, -1],
+            zero_mask_list=[-14, 18],
+            adapt_to_pi=True, # Aloha/Songling
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # agilex_task004  /shared_disk/benchmark/post_train_data/table_setting_agilex
+    TrainConfig(
+        name="pi05_agilex_task_004_table_setting",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id='/shared_disk/benchmark/post_train_data/table_setting_agilex',
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_agilex_task_004_table_setting",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            action_horizon=14,
+            mask_list=[6, -1, 6, -1],
+            zero_mask_list=[-14, 18],
+            adapt_to_pi=True, # Aloha/Songling
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+    # agilex_task005  /shared_disk/benchmark/post_train_data/brush_table_agilex
+    TrainConfig(
+        # 任务名
+        name="pi05_agilex_task_005_brush_table",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # 加载多数据路径
+            repo_id='/shared_disk/benchmark/post_train_data/brush_table_agilex',
+            assets=AssetsConfig(
+                # 加载norm路径
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="pi05_agilex_task_005_brush_table",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            use_delta_joint_actions=True,
+            action_horizon=14,
+            mask_list=[6, -1, 6, -1],
+            zero_mask_list=[-14, 18],
+            adapt_to_pi=True, # Aloha/Songling
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        num_workers=64,
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+    ),
+
+    # ===============================================================================================================================
+
     #
     # Fine-tuning DROID configs.
     #
@@ -1377,9 +2454,8 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
-    #
+
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
-    #
     TrainConfig(
         name="pi0_aloha_sim",
         model=pi0_config.Pi0Config(),
@@ -1391,49 +2467,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
     ),
-    #
-    # Debugging configs.
-    #
-    TrainConfig(
-        name="debug",
-        data=FakeDataConfig(),
-        batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        save_interval=100,
-        overwrite=True,
-        exp_name="debug",
-        num_train_steps=10,
-        wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="debug_restore",
-        data=FakeDataConfig(),
-        batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
-        overwrite=True,
-        exp_name="debug",
-        num_train_steps=10,
-        wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="debug_pi05",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
-        data=FakeDataConfig(),
-        batch_size=2,
-        num_train_steps=10,
-        overwrite=True,
-        exp_name="debug_pi05",
-        wandb_enabled=False,
-    ),
-    #
-    # RoboArena configs.
-    #
-    *roboarena_config.get_roboarena_configs(),
 
-    #
-    # PI05 EBench task26, 3-view, 19-dim base state/action.
-    #
+
+    # PI05 EBench task26, 3-view, 19-dim base state/action. ==================================================================================
     TrainConfig(
         name="pi05_ebench_task26",
         model=pi0_config.Pi0Config(
@@ -1460,18 +2496,69 @@ _CONFIGS = [
         num_workers=64,
         log_interval=100,
         save_interval=5000,
-        keep_period=10_000,
+        keep_period=50_000,
+    ),
+    # Official Inference config for EBench
+    TrainConfig(
+        name="pi0_ebench_all",
+        model=pi0_config.Pi0Config(action_horizon=50),
+        data=LeRobotEBenchDataConfig(
+            repo_id="your/generalist/repo_id",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            action_sequence_keys=["action.joints","action.gripper","action.base"],
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=200_000, 
+        keep_period=50_000,
+        batch_size=128, 
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=200_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=24,
+    ),
+    TrainConfig(
+        name="pi05_ebench_all",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotEBenchDataConfig(
+            repo_id="/shared_disk/users/wenyao.xue/data/EBench-Dataset/",
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/pi05-ebench-generalist/200000/assets",
+                asset_id="ebench",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            action_sequence_keys=["action.joints","action.gripper","action.base"],
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=200_000, 
+        batch_size=128, 
+        keep_period=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=200_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=24,
     ),
 
-    #
-    # PI05 Robocasa, modality.json-based LeRobot datasets.
-    #
+    # PI05 RoboCasa, modality.json-based LeRobot datasets. ==================================================================================
     TrainConfig(
         name="pi05_robocasa_task300",
         model=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=16,
-            discrete_state_input=False,
         ),
         data=LeRobotRobocasaDataConfig(
             repo_id="auto",
@@ -1479,8 +2566,7 @@ _CONFIGS = [
                 assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
                 asset_id="pi05_robocasa_task300",
             ),
-            base_config=DataConfig(prompt_from_task=False),
-            use_delta_actions=False,  # modality.json actions are mixed command signals (base_motion, control_mode, ee deltas, gripper); do not delta against state
+            base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"
@@ -1490,6 +2576,35 @@ _CONFIGS = [
         batch_size=128,
         num_workers=32,
         log_interval=100,
+        save_interval=5000,
+        keep_period=10_000,
+    ),
+    TrainConfig(
+        name="pi05_pretrain_human300",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            max_token_len=200,
+        ),
+        data=LeRobotRobocasaDataConfig(
+            data_dirs=_dataset_soup("pretrain_human300"),
+            assets=AssetsConfig(
+                assets_dir="/shared_disk/users/wenyao.xue/results/openpi/assets",
+                asset_id="",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/shared_disk/models/projects/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        checkpoint_base_dir="/shared_disk/users/wenyao.xue/results/openpi/checkpoints",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=100_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=100_000,
+        batch_size=64,
+        num_workers=4,
         save_interval=5000,
         keep_period=10_000,
     ),

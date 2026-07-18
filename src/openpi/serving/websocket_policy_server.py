@@ -54,22 +54,30 @@ class WebsocketPolicyServer:
         prev_total_time = None
         while True:
             try:
-                start_time = time.monotonic()
+                start_time = time.perf_counter()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
-                infer_time = time.monotonic()
+                infer_start = time.perf_counter()
                 action = self._policy.infer(obs)
-                infer_time = time.monotonic() - infer_time
+                infer_elapsed = time.perf_counter() - infer_start
+                infer_ms = infer_elapsed * 1000
+
+                client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
+                policy_infer_ms = action.get("policy_timing", {}).get("infer_ms")
+                if policy_infer_ms is not None:
+                    logger.info("[%s] Infer: %.2f ms (server) %.2f ms (model)", client_ip, infer_ms, policy_infer_ms)
+                else:
+                    logger.info("[%s] Infer: %.2f ms", client_ip, infer_ms)
 
                 action["server_timing"] = {
-                    "infer_ms": infer_time * 1000,
+                    "infer_ms": infer_ms,
                 }
                 if prev_total_time is not None:
                     # We can only record the last total time since we also want to include the send time.
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
 
                 await websocket.send(packer.pack(action))
-                prev_total_time = time.monotonic() - start_time
+                prev_total_time = time.perf_counter() - start_time
 
             except websockets.ConnectionClosed:
                 logger.info(f"Connection from {websocket.remote_address} closed")
