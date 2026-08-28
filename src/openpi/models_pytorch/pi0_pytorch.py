@@ -25,21 +25,22 @@ def get_safe_dtype(target_dtype, device_type):
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """为标量或逐动作时间计算正余弦嵌入。"""
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    # 同时接受官方批级时间和论文要求的逐动作时间; 其他维度会使条件与动作 token 无法对齐。
+    if time.ndim not in (1, 2):
+        raise ValueError("The time tensor must have shape (batch_size,) or (batch_size, action_horizon).")
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute the outer product
+    # 将最后一维保留给嵌入频率, 从而同时兼容批级时间和逐动作时间。
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = scaling_factor * time[..., None]
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):
@@ -261,7 +262,19 @@ class PI0Pytorch(nn.Module):
             # Set attention masks so that image and language inputs do not attend to state or actions
             att_masks += [1]
 
-        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+        # 在投影前校验时间与动作 token 的形状, 防止逐 token 条件静默广播到错误位置。
+        if timestep.ndim == 1:
+            if timestep.shape[0] != noisy_actions.shape[0]:
+                raise ValueError(
+                    f"Expected timestep batch dimension {noisy_actions.shape[0]}, got {timestep.shape[0]}"
+                )
+        elif timestep.ndim == 2:
+            if timestep.shape != noisy_actions.shape[:2]:
+                raise ValueError(f"Expected token-wise timestep shape {noisy_actions.shape[:2]}, got {timestep.shape}")
+        else:
+            raise ValueError(f"Expected timestep ndim 1 or 2, got {timestep.ndim}")
+
+        # 对应论文第 3 节第 1 项: 每个动作 token 可以接收不同的流匹配时间。
         time_emb = create_sinusoidal_pos_embedding(
             timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
         )
@@ -274,7 +287,9 @@ class PI0Pytorch(nn.Module):
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         if not self.pi05:
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
+            # 标量时间复制到动作序列, 逐动作时间保持原形状, 与论文的 token 条件一一对应。
+            if time_emb.ndim == 2:
+                time_emb = time_emb[:, None, :].expand_as(action_emb)
             action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
             # Apply MLP layers
@@ -324,12 +339,30 @@ class PI0Pytorch(nn.Module):
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
+        return self._compute_loss_standard(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+
+    def _compute_loss_standard(self, images, img_masks, lang_tokens, lang_masks, state, actions, noise, time):
+        """计算官方 PyTorch Pi0 流匹配损失, 保持 RTC 关闭时的原始数值路径。"""
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        return self._compute_loss_from_inputs(
+            images, img_masks, lang_tokens, lang_masks, state, x_t, noise - actions, time
+        )
 
+    def _compute_loss_from_inputs(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        x_t,
+        u_t,
+        model_time,
+    ):
+        """复用两种损失共有的 transformer 前向, 避免拆分后复制模型计算图。"""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, model_time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16

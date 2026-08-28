@@ -46,20 +46,25 @@ def make_attn_mask(input_mask, mask_ar):
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
-) -> at.Float[at.Array, "b {embedding_dim}"]:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    pos: at.Real[at.Array, "*shape"], embedding_dim: int, min_period: float, max_period: float
+) -> at.Float[at.Array, "*shape {embedding_dim}"]:
+    """为标量或逐动作时间计算正余弦嵌入。"""
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
 
     fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
     period = min_period * (max_period / min_period) ** fraction
-    sinusoid_input = jnp.einsum(
-        "i,j->ij",
-        pos,
-        1.0 / period * 2 * jnp.pi,
-        precision=jax.lax.Precision.HIGHEST,
-    )
+    if pos.ndim == 1:
+        # 保留官方批级时间路径的原始 einsum, 避免 RTC 关闭时引入不必要的数值变化。
+        sinusoid_input = jnp.einsum(
+            "i,j->ij",
+            pos,
+            1.0 / period * 2 * jnp.pi,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+    else:
+        # RTC 仅在动作时间带 token 维时逐元素相乘; 标量分支继续保留官方计算路径。
+        sinusoid_input = pos[..., None] * (1.0 / period * 2 * jnp.pi)
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
@@ -138,12 +143,12 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"] | at.Float[at.Array, "b ah"],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | at.Float[at.Array, "b ah emb"] | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -157,6 +162,17 @@ class Pi0(_model.BaseModel):
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
+        # 同时兼容官方批级时间和 RTC 的 (B,H) 时间, 避免时间与动作 token 错位。
+        if timestep.ndim == 1:
+            if timestep.shape[0] != noisy_actions.shape[0]:
+                raise ValueError(f"Expected timestep batch dimension {noisy_actions.shape[0]}, got {timestep.shape[0]}")
+        elif timestep.ndim == 2:
+            if timestep.shape != noisy_actions.shape[:2]:
+                raise ValueError(f"Expected token-wise timestep shape {noisy_actions.shape[:2]}, got {timestep.shape}")
+        else:
+            raise ValueError(f"Expected timestep ndim 1 or 2, got {timestep.ndim}")
+
+        # 对应论文第 3 节第 1 项: 每个动作 token 可以接收不同的流匹配时间。
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         if self.pi05:
@@ -169,7 +185,12 @@ class Pi0(_model.BaseModel):
             adarms_cond = time_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            # 标量时间需要复制到每个动作 token, 逐动作时间则直接保持 (B,H,emb) 以免丢失 RTC 条件。
+            time_tokens = (
+                einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+                if time_emb.ndim == 2
+                else time_emb
+            )
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
@@ -191,17 +212,23 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        return self._compute_loss_standard(noise_rng, time_rng, observation, actions)
 
+    def _compute_loss_standard(self, noise_rng, time_rng, observation, actions):
+        """计算官方 Pi0 流匹配损失, 保持 RTC 关闭时的原始数值路径。"""
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        return self._compute_loss_from_inputs(observation, x_t, noise - actions, time)
+
+    def _compute_loss_from_inputs(self, observation, x_t, u_t, model_time):
+        """复用两种损失共有的 transformer 前向, 避免拆分后复制模型计算图。"""
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, model_time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)

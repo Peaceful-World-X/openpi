@@ -48,7 +48,9 @@ class Policy(BasePolicy):
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
         """
         self._model = model
-        self._input_transform = _transforms.compose(transforms)
+        # 保存原始变换序列供扩展策略重放请求数据, 避免复制基础推理控制流。
+        self._input_transforms = tuple(transforms)
+        self._input_transform = _transforms.compose(self._input_transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
@@ -66,20 +68,38 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        return self._infer(obs, noise=noise, request_sample_kwargs={})
+
+    # 子类只需准备额外采样参数; 输入变换、后端转换和输出处理继续共享同一路径。
+    def _infer(
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None,
+        request_sample_kwargs: dict[str, np.ndarray],
+    ) -> dict:
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
+        # 观测与请求级采样参数在这里统一增加 batch 维并转换后端类型, 保证两种后端接口一致。
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+            request_sample_kwargs = jax.tree.map(
+                lambda x: jnp.asarray(x)[np.newaxis, ...], request_sample_kwargs
+            )
         else:
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
+            request_sample_kwargs = jax.tree.map(
+                lambda x: torch.from_numpy(np.asarray(x)).to(self._pytorch_device)[None, ...], request_sample_kwargs
+            )
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        sample_kwargs.update(request_sample_kwargs)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 

@@ -5,7 +5,9 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from openpi.models import pi0_rtc_config
 import openpi.models.model as _model
+from openpi.policies import rtc_policy
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -72,7 +74,9 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    # RTC 配置使用专用协议策略; 标准配置继续返回无 RTC 字段的普通 Policy。
+    policy_class = rtc_policy.RTCPolicy if isinstance(train_config.model, pi0_rtc_config.Pi0RTCConfig) else _policy.Policy
+    return policy_class(
         model,
         transforms=[
             *repack_transforms.inputs,

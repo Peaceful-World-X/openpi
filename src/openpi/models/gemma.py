@@ -126,7 +126,12 @@ class RMSNorm(nn.Module):
 
         # adaptive RMSNorm
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
-        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
+        # 论文第 3 节第 1 项要求逐动作 token 注入流时间; 批级条件仍需扩展 token 维以保持原行为。
+        if modulation.ndim == 2:
+            modulation = modulation[:, None, :]
+        elif modulation.ndim != x.ndim or modulation.shape[:-1] != x.shape[:-1]:
+            raise ValueError(f"Expected cond leading dimensions {x.shape[:-1]}, got {cond.shape[:-1]}")
+        scale, shift, gate = jnp.split(modulation, 3, axis=-1)
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
 
@@ -392,7 +397,8 @@ class Module(nn.Module):
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
-        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        # 论文第 3 节第 1 项只改变条件的广播粒度, 不改变参数结构, 因此同时兼容批级和逐动作条件。
+        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | at.Float[at.Array, "b _t _d"] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,

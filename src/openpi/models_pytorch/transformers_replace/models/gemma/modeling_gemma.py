@@ -80,15 +80,17 @@ class GemmaRMSNorm(nn.Module):
             normed_inputs = normed_inputs * (1.0 + self.weight.float())
             return normed_inputs.to(dtype), None  # return in original dtype with None gate
         
-        # adaptive RMSNorm (if cond is provided and dense layer exists)
+        # 先校验条件最后一维, 再区分批级广播与逐 token 条件, 避免错误形状被静默接受。
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
         
         #self.dense.to(dtype=torch.bfloat16).to(dtype=torch.float32)
         modulation = self.dense(cond)
-        # Reshape modulation to broadcast properly: [batch, 1, features] for [batch, seq, features]
-        if len(x.shape) == 3:  # [batch, seq, features]
+        # 批级条件扩展为 [batch, 1, features]; 论文第 3 节的逐动作条件已是 [batch, seq, features]。
+        if cond.ndim == 2 and x.ndim == 3:
             modulation = modulation.unsqueeze(1)
+        elif cond.ndim != x.ndim or cond.shape[:-1] != x.shape[:-1]:
+            raise ValueError(f"Expected cond leading dimensions {x.shape[:-1]}, got {cond.shape[:-1]}")
         
         scale, shift, gate = torch.chunk(modulation, 3, dim=-1)
         
