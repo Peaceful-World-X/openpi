@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -17,6 +18,9 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+import openpi.policies.agilexbag_image_policy as agilexbag_image_policy
+
+# import openpi.policies.agilexbag_policy as agilexbag_policy
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
@@ -32,6 +36,9 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+AGILEX_LEROBOT_REPO = os.environ.get("AGILEX_LEROBOT_REPO", "your_hf_username/agilex_ethernet_lerobot")
+AGILEX_PI05_BASE_CKPT = os.environ.get("AGILEX_PI05_BASE_CKPT", "gs://openpi-assets/checkpoints/pi05_base/params")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -356,6 +363,74 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LerobotAgilexBagImageDataConfig(DataConfigFactory):
+    """Data config for Agilex bag dataset with global + fisheye + depth cameras."""
+
+    use_delta_joint_actions: bool = False
+    default_prompt: str | None = None
+    output_action_dim: int = 7
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "global_camera": "observation.images.global_camera",
+                            "pikaGripperFisheyeCamera": "observation.images.pikaGripperFisheyeCamera",
+                            "pikaGripperDepthCamera": "observation.images.pikaGripperDepthCamera",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        default_prompt = self.default_prompt
+        repack_transforms = self.repack_transforms
+
+        if self.base_config and self.base_config.prompt_from_task:
+            default_prompt = None
+            original_repack = self.repack_transforms.inputs[0]
+            new_structure = dict(original_repack.structure)
+            new_structure["prompt"] = "prompt"
+            repack_transforms = _transforms.Group(inputs=[_transforms.RepackTransform(new_structure)])
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                agilexbag_image_policy.AgilexBagImageInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[agilexbag_image_policy.AgilexBagImageOutputs(action_dim=self.output_action_dim)],
+        )
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -527,6 +602,13 @@ class TrainConfig:
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
+
+    # RLT (Representation Learning Token) configuration fields.
+    rlt_num_tokens: int | None = None
+    rlt_num_layers: int | None = None
+    rlt_embed_dim: int | None = None
+    rlt_input_dim: int | None = None
+    rlt_alpha: float | None = None
 
     # If the value is greater than 1, FSDP will be enabled and shard across number of specified devices; overall
     # device memory will be reduced but training could potentially be slower.
@@ -931,6 +1013,55 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     #
+    # Agilex bag image (3 cameras) fine-tuning config.
+    #
+    TrainConfig(
+        name="pi05_agilexbag_image",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LerobotAgilexBagImageDataConfig(
+            repo_id=AGILEX_LEROBOT_REPO,
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(AGILEX_PI05_BASE_CKPT),
+        num_train_steps=100_000,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="pi05_agilexbag_image_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LerobotAgilexBagImageDataConfig(
+            repo_id=AGILEX_LEROBOT_REPO,
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(AGILEX_PI05_BASE_CKPT),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=100_000,
+        num_workers=8,
+    ),
+    #
     # Debugging configs.
     #
     TrainConfig(
@@ -968,6 +1099,180 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    #
+    # RLT (Representation Learning Token) configs.
+    #
+    TrainConfig(
+        name="debug_rlt",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_rlt",
+        wandb_enabled=False,
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=64,
+        rlt_input_dim=64,
+        rlt_alpha=0.0,
+    ),
+    TrainConfig(
+        name="debug_rlt_joint",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_rlt_joint",
+        wandb_enabled=False,
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=64,
+        rlt_input_dim=64,
+        rlt_alpha=1.0,
+    ),
+    TrainConfig(
+        name="rlt_pi05",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=FakeDataConfig(),
+        batch_size=32,
+        num_train_steps=5000,
+        exp_name="rlt_pi05",
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+        rlt_alpha=0.0,
+    ),
+    TrainConfig(
+        name="rlt_pi05_agilexbag_image",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LerobotAgilexBagImageDataConfig(
+            repo_id=AGILEX_LEROBOT_REPO,
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(AGILEX_PI05_BASE_CKPT),
+        num_train_steps=5000,
+        num_workers=8,
+        exp_name="rlt_pi05_agilexbag_image",
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+        rlt_alpha=0.0,
+    ),
+    TrainConfig(
+        name="rlt_pi05_agilexbag_image_joint",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LerobotAgilexBagImageDataConfig(
+            repo_id=AGILEX_LEROBOT_REPO,
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(AGILEX_PI05_BASE_CKPT),
+        num_train_steps=5000,
+        num_workers=8,
+        exp_name="rlt_pi05_agilexbag_image_joint",
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+        rlt_alpha=1.0,
+    ),
+    # ===== Delta action VLA-only config (no RLT) =====
+    TrainConfig(
+        name="pi05_agilexbag_image_delta",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+        ),
+        data=LerobotAgilexBagImageDataConfig(
+            repo_id=AGILEX_LEROBOT_REPO,
+            use_delta_joint_actions=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(AGILEX_PI05_BASE_CKPT),
+        num_train_steps=100_000,
+        num_workers=8,
+    ),
+    # ===== Delta action RLT configs =====
+    TrainConfig(
+        name="rlt_pi05_agilexbag_image_delta",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LerobotAgilexBagImageDataConfig(
+            repo_id=AGILEX_LEROBOT_REPO,
+            use_delta_joint_actions=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(AGILEX_PI05_BASE_CKPT),
+        num_train_steps=5000,
+        num_workers=8,
+        exp_name="rlt_pi05_agilexbag_image_delta",
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+        rlt_alpha=0.0,
+    ),
+    TrainConfig(
+        name="rlt_pi05_agilexbag_image_delta_joint",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LerobotAgilexBagImageDataConfig(
+            repo_id=AGILEX_LEROBOT_REPO,
+            use_delta_joint_actions=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(AGILEX_PI05_BASE_CKPT),
+        num_train_steps=5000,
+        num_workers=8,
+        exp_name="rlt_pi05_agilexbag_image_delta_joint",
+        rlt_num_tokens=1,
+        rlt_num_layers=2,
+        rlt_embed_dim=2048,
+        rlt_input_dim=2048,
+        rlt_alpha=1.0,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
