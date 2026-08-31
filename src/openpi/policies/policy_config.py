@@ -6,6 +6,8 @@ from typing import Any
 import jax.numpy as jnp
 
 import openpi.models.model as _model
+import openpi.models.pi0_config as pi0_config
+import openpi.policies.mem_policy as mem_policy
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -22,6 +24,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    high_level_policy: Any | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +40,7 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        high_level_policy: Optional external-VLM high-level policy used by MEM inference.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -48,6 +52,11 @@ def create_trained_policy(
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
+    mem = train_config.model.mem if isinstance(train_config.model, pi0_config.Pi0Config) else None
+    mem_enabled = mem is not None and (mem.use_video_memory or mem.use_state_history or mem.use_language_memory)
+    if mem_enabled and is_pytorch:
+        # 必须在创建 PyTorch 模型前拒绝, 避免进入尚未实现的 MEM 参数路径。
+        raise NotImplementedError("MEM currently supports JAX Pi0/Pi05 only")
 
     logging.info("Loading model...")
     if is_pytorch:
@@ -72,7 +81,21 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    policy_class = mem_policy.MEMPolicy if mem_enabled else _policy.Policy
+    mem_kwargs = {}
+    if mem_enabled:
+        # MEM 参数集中由策略工厂注入, 普通 Policy 的构造接口保持不变。
+        mem_kwargs = {
+            "num_video_frames": mem.video_memory_frames,
+            "use_video_memory": mem.use_video_memory,
+            "use_state_history": mem.use_state_history,
+            "use_language_memory": mem.use_language_memory,
+            "max_memory_tokens": mem.max_memory_tokens,
+            "image_key_map": data_config.memory.image_key_map,
+            "state_key": data_config.memory.state_key,
+            "high_level_policy": high_level_policy,
+        }
+    return policy_class(
         model,
         transforms=[
             *repack_transforms.inputs,
@@ -91,4 +114,5 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+        **mem_kwargs,
     )

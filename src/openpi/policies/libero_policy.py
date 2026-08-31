@@ -68,6 +68,33 @@ class LiberoInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
             },
         }
+        if data.get("image_history") is not None:
+            aliases = {
+                "observation/image": "base_0_rgb",
+                "observation/wrist_image": "left_wrist_0_rgb",
+                "base_0_rgb": "base_0_rgb",
+                "left_wrist_0_rgb": "left_wrist_0_rgb",
+                "right_wrist_0_rgb": "right_wrist_0_rgb",
+            }
+            converted = {}
+            for key, raw_frames in data["image_history"].items():
+                if key not in aliases:
+                    continue
+                frames = np.asarray(raw_frames)
+                if np.issubdtype(frames.dtype, np.floating):
+                    frames = (255 * frames).astype(np.uint8)
+                if frames.ndim == 4 and frames.shape[1] == 3:
+                    frames = einops.rearrange(frames, "k c h w -> k h w c")
+                converted[aliases[key]] = frames
+            inputs["image_history"] = converted
+            masks = data.get("image_history_masks", data.get("image_history_mask"))
+            if masks is not None:
+                inputs["image_history_masks"] = {
+                    aliases[key]: np.asarray(value) for key, value in masks.items() if key in aliases
+                }
+        for key in ("state_history", "language_memory", "tokenized_memory", "tokenized_memory_mask"):
+            if data.get(key) is not None:
+                inputs[key] = data[key]
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.

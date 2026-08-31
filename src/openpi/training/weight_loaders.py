@@ -50,6 +50,17 @@ class CheckpointWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        # 训练入口也必须迁移 scan 视觉权重, 否则只在推理 load() 可用。
+        flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+        flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+        target_video = any("/encoderblock_0/" in f"/{key}/" for key in flat_ref)
+        target_state = any("state_history_proj" in key for key in flat_ref)
+        source_scan = any("/encoderblock/" in f"/{key}/" for key in flat_loaded)
+        source_state = any("state_history_proj" in key for key in flat_loaded)
+        if (target_video and source_scan) or (target_state and not source_state):
+            from openpi.models.mem_checkpoint import migrate_scan_params
+
+            loaded_params = migrate_scan_params(loaded_params, params, allow_missing_lora=True)
         # Add all missing LoRA weights.
         return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 

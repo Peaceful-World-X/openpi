@@ -62,6 +62,35 @@ class DroidInputs(transforms.DataTransformFn):
             "image": dict(zip(names, images, strict=True)),
             "image_mask": dict(zip(names, image_masks, strict=True)),
         }
+        if data.get("image_history") is not None:
+            aliases = {
+                "observation/exterior_image_1_left": "base_0_rgb",
+                "observation.images.exterior_image_1_left": "base_0_rgb",
+                "observation/wrist_image_left": "left_wrist_0_rgb",
+                "observation.images.wrist_image_left": "left_wrist_0_rgb",
+                "base_0_rgb": "base_0_rgb",
+                "left_wrist_0_rgb": "left_wrist_0_rgb",
+                "right_wrist_0_rgb": "right_wrist_0_rgb",
+            }
+            converted = {}
+            for key, raw_frames in data["image_history"].items():
+                if key not in aliases:
+                    continue
+                frames = np.asarray(raw_frames)
+                if np.issubdtype(frames.dtype, np.floating):
+                    frames = (255 * frames).astype(np.uint8)
+                if frames.ndim == 4 and frames.shape[1] == 3:
+                    frames = einops.rearrange(frames, "k c h w -> k h w c")
+                converted[aliases[key]] = frames
+            inputs["image_history"] = converted
+            masks = data.get("image_history_masks", data.get("image_history_mask"))
+            if masks is not None:
+                inputs["image_history_masks"] = {
+                    aliases[key]: np.asarray(value) for key, value in masks.items() if key in aliases
+                }
+        for key in ("state_history", "language_memory", "tokenized_memory", "tokenized_memory_mask"):
+            if data.get(key) is not None:
+                inputs[key] = data[key]
 
         if "actions" in data:
             inputs["actions"] = np.asarray(data["actions"])

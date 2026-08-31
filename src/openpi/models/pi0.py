@@ -78,16 +78,29 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        self.use_video_memory = config.mem.use_video_memory
+        self.use_language_memory = config.mem.use_language_memory
+        self.use_state_history = config.mem.use_state_history
+        self.num_video_frames = config.mem.video_memory_frames if config.mem.use_video_memory else 1
+        self.state_history_frames = config.mem.video_memory_frames
+        self.max_memory_tokens = config.mem.max_memory_tokens
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
                 variant="So400m/14",
                 pool_type="none",
-                scan=True,
+                scan=self.num_video_frames == 1,
                 dtype_mm=config.dtype,
+                num_timesteps=self.num_video_frames,
+                temporal_attn_every=config.mem.temporal_attn_every_n_layers,
+                drop_history_after_layer=config.mem.drop_history_tokens_after_layer,
             )
         )
-        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        dummy_image = next(iter(config.fake_obs().images.values()))
+        if self.num_video_frames > 1:
+            # 视频编码器初始化时需要展平 B*K 帧。
+            dummy_image = jnp.broadcast_to(dummy_image, (self.num_video_frames, *dummy_image.shape[1:]))
+        img.lazy_init(dummy_image, train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
@@ -97,6 +110,9 @@ class Pi0(_model.BaseModel):
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+        if self.use_state_history:
+            # 历史状态使用新增投影, 当前 state 路径保持不变。
+            self.state_history_proj = nnx.Linear(config.action_dim, paligemma_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
@@ -109,9 +125,33 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
+        if self.use_language_memory:
+            if obs.tokenized_memory is None:
+                batch_size = obs.state.shape[0]
+                memory_ids = jnp.zeros((batch_size, self.max_memory_tokens), dtype=jnp.int32)
+                memory_mask = jnp.zeros((batch_size, self.max_memory_tokens), dtype=jnp.bool_)
+            else:
+                memory_ids = obs.tokenized_memory
+                memory_mask = obs.tokenized_memory_mask
+            memory_tokens = self.PaliGemma.llm(memory_ids, method="embed")
+            if memory_mask is None:
+                memory_mask = jnp.ones(memory_tokens.shape[:2], dtype=jnp.bool_)
+            tokens.append(memory_tokens)
+            input_mask.append(memory_mask)
+            ar_mask += [False] * memory_tokens.shape[1]
+
         # embed images
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            if self.use_video_memory:
+                history = obs.image_history.get(name) if obs.image_history is not None else None
+                history_masks = obs.image_history_masks.get(name) if obs.image_history_masks is not None else None
+                if history is None:
+                    # 首步缺少历史时复制当前帧, 并用 mask 标为 padding。
+                    history = jnp.repeat(obs.images[name][:, None], self.num_video_frames - 1, axis=1)
+                    history_masks = jnp.zeros((obs.images[name].shape[0], self.num_video_frames - 1), dtype=jnp.bool_)
+                image_tokens = self._encode_video_frames(obs.images[name], history, history_masks)
+            else:
+                image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -131,10 +171,39 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+        if self.use_state_history:
+            if obs.state_history is None:
+                state_history = jnp.repeat(obs.state[:, None, :], self.state_history_frames - 1, axis=1)
+            else:
+                state_history = obs.state_history
+            state_tokens = self.state_history_proj(state_history)
+            tokens.append(state_tokens)
+            input_mask.append(jnp.ones(state_tokens.shape[:2], dtype=jnp.bool_))
+            ar_mask += [False] * state_tokens.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+
+    def _encode_video_frames(self, current_image, image_history, history_masks=None):
+        """按最旧到当前的顺序编码 K 帧, 并返回当前帧 token。"""
+        k = self.num_video_frames
+        if k <= 1:
+            return self.PaliGemma.img(current_image, train=False)[0]
+        if image_history.ndim != 5 or image_history.shape[1] != k - 1:
+            raise ValueError(f"image_history must have shape (B, {k - 1}, H, W, C), got {image_history.shape}")
+        batch = current_image.shape[0]
+        frames = jnp.concatenate([image_history, current_image[:, None]], axis=1)
+        flat = frames.reshape((batch * k, *frames.shape[-3:]))
+        if history_masks is None:
+            history_masks = jnp.ones((batch, k - 1), dtype=jnp.bool_)
+        frame_mask = jnp.concatenate(
+            [jnp.asarray(history_masks, dtype=jnp.bool_), jnp.ones((batch, 1), dtype=jnp.bool_)], axis=1
+        )
+        encoded, _ = self.PaliGemma.img(flat, train=False, frame_mask=frame_mask)
+        if encoded.shape[0] == batch * k:
+            encoded = encoded.reshape(batch, k, encoded.shape[-2], encoded.shape[-1])[:, -1]
+        return encoded
 
     @at.typecheck
     def embed_suffix(

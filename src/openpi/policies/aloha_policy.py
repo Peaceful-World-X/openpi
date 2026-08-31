@@ -74,6 +74,37 @@ class AlohaInputs(transforms.DataTransformFn):
             "image_mask": image_masks,
             "state": data["state"],
         }
+        if data.get("image_history") is not None:
+            aliases = {
+                "cam_high": "base_0_rgb",
+                "cam_left_wrist": "left_wrist_0_rgb",
+                "cam_right_wrist": "right_wrist_0_rgb",
+                "base_0_rgb": "base_0_rgb",
+                "left_wrist_0_rgb": "left_wrist_0_rgb",
+                "right_wrist_0_rgb": "right_wrist_0_rgb",
+            }
+            converted = {}
+            for source, raw_frames in data["image_history"].items():
+                if source not in aliases:
+                    continue
+                frames = np.asarray(raw_frames)
+                if np.issubdtype(frames.dtype, np.floating):
+                    frames = (255 * frames).astype(np.uint8)
+                if frames.ndim == 4 and frames.shape[1] == 3:
+                    frames = einops.rearrange(frames, "k c h w -> k h w c")
+                converted[aliases[source]] = frames
+            inputs["image_history"] = converted
+            masks = data.get("image_history_masks", data.get("image_history_mask"))
+            if masks is not None:
+                inputs["image_history_masks"] = {
+                    aliases[key]: np.asarray(value) for key, value in masks.items() if key in aliases
+                }
+        if data.get("state_history") is not None:
+            # 历史 state 必须执行与当前 state 相同的坐标变换。
+            inputs["state_history"] = _decode_state_history(data["state_history"], adapt_to_pi=self.adapt_to_pi)
+        for key in ("language_memory", "tokenized_memory", "tokenized_memory_mask"):
+            if data.get(key) is not None:
+                inputs[key] = data[key]
 
         # Actions are only available during training.
         if "actions" in data:
@@ -185,6 +216,22 @@ def _decode_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray
         # Reverse the gripper transformation that is being applied by the Aloha runtime.
         state[[6, 13]] = _gripper_to_angular(state[[6, 13]])
     return state
+
+
+def _decode_state_history(state_history: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
+    """沿最后一维批量执行 ALOHA 状态解码。"""
+    state_history = np.asarray(state_history)
+    if not adapt_to_pi:
+        return state_history
+    if state_history.shape[-1] != 14:
+        raise ValueError(f"ALOHA state_history must have 14 dimensions, got {state_history.shape}")
+    decoded = np.array(
+        _joint_flip_mask() * state_history,
+        dtype=np.result_type(state_history.dtype, np.float32),
+        copy=True,
+    )
+    decoded[..., [6, 13]] = _gripper_to_angular(decoded[..., [6, 13]])
+    return decoded
 
 
 def _encode_actions(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:

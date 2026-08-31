@@ -106,26 +106,138 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # MEM 可选字段: 历史帧、历史状态和长期语言记忆。默认 None 保持旧接口。
+    # 使用 object 避免 jaxtyping 对可变 K/M 维度做跨字段推断, 具体形状在 from_dict 中校验。
+    image_history: dict[str, object] | None = None
+    image_history_masks: dict[str, object] | None = None
+    state_history: object | None = None
+    tokenized_memory: object | None = None
+    tokenized_memory_mask: object | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
-        # If images are uint8, convert them to [-1, 1] float32.
-        for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+
+        def normalize_image(value, *, torch_channel_first: bool = False):
+            """将 uint8 图像(包括历史帧)转换为模型使用的 [-1, 1]。"""
+            if getattr(value, "dtype", None) == np.uint8:
+                return value.astype(np.float32) / 255.0 * 2.0 - 1.0
+            if getattr(value, "dtype", None) == torch.uint8:
+                value = value.to(torch.float32)
+                if torch_channel_first and getattr(value, "ndim", 0) == 4:
+                    value = value.permute(0, 3, 1, 2)
+                return value / 255.0 * 2.0 - 1.0
+            return value
+
+        def bool_array(value):
+            """转换 mask dtype 时保留 NumPy/JAX/PyTorch 后端, 避免数据加载时回拷到主机。"""
+            if isinstance(value, torch.Tensor):
+                return value.to(dtype=torch.bool)
+            if hasattr(value, "astype"):
+                return value.astype(np.bool_)
+            return np.asarray(value, dtype=np.bool_)
+
+        def ones_mask_like(frames, shape):
+            """缺省历史 mask 与帧数组保持相同设备和数组后端。"""
+            if isinstance(frames, torch.Tensor):
+                return torch.ones(shape, dtype=torch.bool, device=frames.device)
+            if isinstance(frames, jax.Array):
+                return jnp.ones(shape, dtype=jnp.bool_)
+            return np.ones(shape, dtype=np.bool_)
+
+        images = {key: normalize_image(value, torch_channel_first=True) for key, value in data["image"].items()}
+        image_history = None
+        image_history_masks = data.get("image_history_masks", data.get("image_history_mask"))
+        if data.get("image_history") is None and image_history_masks is not None:
+            raise ValueError("image_history_masks cannot be provided without image_history")
+        if data.get("image_history") is not None:
+            image_history = {key: normalize_image(value) for key, value in data["image_history"].items()}
+            if not set(image_history).issubset(images):
+                raise ValueError("image_history camera keys must be a subset of image keys")
+            if image_history_masks is None:
+                image_history_masks = {
+                    key: ones_mask_like(frames, frames.shape[:-3]) for key, frames in image_history.items()
+                }
+            elif set(image_history_masks) != set(image_history):
+                raise ValueError("image_history and image_history_masks must contain the same camera keys")
+            else:
+                image_history_masks = {key: bool_array(mask) for key, mask in image_history_masks.items()}
+            history_prefix = None
+            batch_prefix = data["state"].shape[:-1]
+            for key, frames in image_history.items():
+                if getattr(frames, "ndim", 0) < 4:
+                    raise ValueError(f"image_history[{key!r}] must have shape (*b, k, h, w, c), got {frames.shape}")
+                if frames.shape[-1] != 3:
+                    raise ValueError(
+                        f"image_history[{key!r}] must have RGB channels in the last dimension, got {frames.shape}"
+                    )
+                if frames.shape[:-4] != batch_prefix:
+                    raise ValueError(
+                        f"image_history[{key!r}] batch prefix {frames.shape[:-4]} does not match state prefix "
+                        f"{batch_prefix}"
+                    )
+                if history_prefix is None:
+                    history_prefix = frames.shape[:-3]
+                elif frames.shape[:-3] != history_prefix:
+                    raise ValueError(
+                        f"all image_history cameras must share prefix shape {history_prefix}, got {frames.shape[:-3]}"
+                    )
+                if image_history_masks[key].shape != frames.shape[:-3]:
+                    raise ValueError(
+                        f"image_history_masks[{key!r}] shape {image_history_masks[key].shape} "
+                        f"does not match history prefix {frames.shape[:-3]}"
+                    )
+        state_history = data.get("state_history")
+        if state_history is not None:
+            if getattr(state_history, "ndim", 0) < 2:
+                raise ValueError(f"state_history must have shape (*b, k, s), got {state_history.shape}")
+            state_prefix = data["state"].shape[:-1]
+            if state_history.shape[:-2] != state_prefix:
+                raise ValueError(
+                    f"state_history batch prefix {state_history.shape[:-2]} does not match state prefix {state_prefix}"
+                )
+            if state_history.shape[-1] != data["state"].shape[-1]:
+                raise ValueError(
+                    f"state_history state dimension {state_history.shape[-1]} does not match current state "
+                    f"dimension {data['state'].shape[-1]}"
+                )
+            if image_history_masks:
+                expected_prefix = next(iter(image_history_masks.values())).shape
+                if state_history.shape[:-1] != expected_prefix:
+                    raise ValueError(
+                        f"state_history shape {state_history.shape} does not match history prefix {expected_prefix}"
+                    )
+        if (data.get("tokenized_memory") is None) != (data.get("tokenized_memory_mask") is None):
+            raise ValueError("tokenized_memory and tokenized_memory_mask must be provided together")
+        if data.get("tokenized_memory") is not None:
+            memory = data["tokenized_memory"]
+            memory_mask = data["tokenized_memory_mask"]
+            if getattr(memory, "ndim", 0) < 1 or memory.shape != memory_mask.shape:
+                raise ValueError(
+                    "tokenized_memory and tokenized_memory_mask must have identical shape, "
+                    f"got {memory.shape} and {memory_mask.shape}"
+                )
+            if memory.shape[:-1] != data["state"].shape[:-1]:
+                raise ValueError(
+                    f"tokenized_memory batch prefix {memory.shape[:-1]} does not match state prefix "
+                    f"{data['state'].shape[:-1]}"
+                )
         return cls(
-            images=data["image"],
+            images=images,
             image_masks=data["image_mask"],
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            image_history=image_history,
+            image_history_masks=image_history_masks,
+            state_history=state_history,
+            tokenized_memory=data.get("tokenized_memory"),
+            tokenized_memory_mask=data.get("tokenized_memory_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -197,6 +309,22 @@ def preprocess_observation(
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
+    # 历史帧只做批量 resize, 不做随机增强, 避免同一时间窗口内产生不一致视图。
+    out_image_history = None
+    out_image_history_masks = observation.image_history_masks
+    if observation.image_history is not None:
+        out_image_history = {}
+        for key in image_keys:
+            if key not in observation.image_history:
+                continue
+            history = observation.image_history[key]
+            if history.shape[-3:-1] != image_resolution:
+                original_shape = history.shape
+                flat = history.reshape((-1, *history.shape[-3:]))
+                flat = image_tools.resize_with_pad(flat, *image_resolution)
+                history = flat.reshape((*original_shape[:-3], *image_resolution, original_shape[-1]))
+            out_image_history[key] = history
+
     return Observation(
         images=out_images,
         image_masks=out_masks,
@@ -205,6 +333,11 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        image_history=out_image_history,
+        image_history_masks=out_image_history_masks,
+        state_history=observation.state_history,
+        tokenized_memory=observation.tokenized_memory,
+        tokenized_memory_mask=observation.tokenized_memory_mask,
     )
 
 

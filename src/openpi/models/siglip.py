@@ -108,6 +108,90 @@ class Encoder1DBlock(nn.Module):
         return x, out
 
 
+class SpaceTimeSeparableBlock(nn.Module):
+    """在空间 ViT block 后复用同一注意力参数做时间注意力。"""
+
+    mlp_dim: int | None = None
+    num_heads: int = 12
+    dropout: float = 0.0
+    dtype_mm: str = "float32"
+    num_timesteps: int = 1
+
+    @nn.compact
+    def __call__(self, x, deterministic=True, frame_mask=None):  # noqa: FBT002
+        bk, n, d = x.shape
+        k = self.num_timesteps
+        if k < 1 or bk % k:
+            raise ValueError(f"expected flattened (B*K, N, D) with K={k}, got {x.shape}")
+        b = bk // k
+        out = {}
+        x = sharding.activation_sharding_constraint(x)
+
+        # 参数名与标准 Encoder1DBlock 完全一致; temporal 分支复用同一参数。
+        norm = nn.LayerNorm(name="LayerNorm_0", dtype=self.dtype_mm)
+        attn = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            kernel_init=nn.initializers.xavier_uniform(),
+            deterministic=deterministic,
+            dtype=self.dtype_mm,
+            name="MultiHeadDotProductAttention_0",
+        )
+        normalized = norm(x)
+        y = out["sa"] = attn(normalized, normalized)
+        y = sharding.activation_sharding_constraint(y)
+        y = nn.Dropout(rate=self.dropout)(y, deterministic)
+        x = out["+sa"] = x + y
+        y = out["mlp"] = MlpBlock(
+            mlp_dim=self.mlp_dim,
+            dropout=self.dropout,
+            dtype_mm=self.dtype_mm,
+            name="MlpBlock_0",
+        )(nn.LayerNorm(name="LayerNorm_1", dtype=self.dtype_mm)(x), deterministic)
+        y = sharding.activation_sharding_constraint(y)
+        y = nn.Dropout(rate=self.dropout)(y, deterministic)
+        x = out["+mlp"] = x + y
+        x = sharding.activation_sharding_constraint(x)
+        if k == 1:
+            return x, out
+
+        # 每个 patch 沿时间轴做 causal attention, 同时屏蔽 episode 起始 padding。
+        x_t = x.reshape(b, k, n, d).transpose(0, 2, 1, 3).reshape(b * n, k, d)
+        x_t = x_t + self._sinusoidal_time_emb(k, d).astype(x_t.dtype)[None]
+        causal = jnp.tril(jnp.ones((k, k), dtype=jnp.bool_))[None]
+        if frame_mask is None:
+            valid = jnp.ones((b, k), dtype=jnp.bool_)
+        else:
+            valid = jnp.asarray(frame_mask, dtype=jnp.bool_)
+            if valid.shape != (b, k):
+                raise ValueError(f"frame_mask must have shape {(b, k)}, got {valid.shape}")
+        valid = jnp.repeat(valid, n, axis=0)
+        valid_queries = valid[:, :, None]
+        valid_keys = valid[:, None, :]
+        padding_self = ~valid_queries & jnp.eye(k, dtype=jnp.bool_)[None]
+        temporal_mask = (causal & ((valid_queries & valid_keys) | padding_self))[:, None]
+        temporal_normalized = norm(x_t)
+        y_t = out["temporal"] = attn(temporal_normalized, temporal_normalized, mask=temporal_mask)
+        x_t = x_t + nn.Dropout(rate=self.dropout)(y_t, deterministic)
+        x = x_t.reshape(b, n, k, d).transpose(0, 2, 1, 3).reshape(bk, n, d)
+        out["+temporal"] = x
+        return sharding.activation_sharding_constraint(x), out
+
+    @staticmethod
+    def _sinusoidal_time_emb(k: int, d: int):
+        """生成固定时间位置编码, 并将当前帧(最后位置)平移到零。"""
+        if d % 2:
+            raise ValueError(f"embedding dimension must be even for temporal embedding, got {d}")
+        half = d // 2
+        # 输入按最旧到当前排列, 因此直接使用负的相对时间坐标 t in [-(K-1), 0]。
+        positions = jnp.arange(k, dtype=jnp.float32) - (k - 1)
+        freq = jnp.exp(-jnp.log(10000.0) * jnp.arange(half) / jnp.maximum(half - 1, 1))
+        embedding = jnp.concatenate(
+            [jnp.sin(positions[:, None] * freq[None, :]), jnp.cos(positions[:, None] * freq[None, :])], axis=-1
+        )
+        # cos(0)=1, 减去当前帧常量后满足论文边界条件 e(0)=0。
+        return embedding - embedding[-1:]
+
+
 class Encoder(nn.Module):
     """Transformer Model Encoder for sequence to sequence translation."""
 
@@ -118,12 +202,17 @@ class Encoder(nn.Module):
     scan: bool = False
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    num_timesteps: int = 1
+    temporal_attn_every: int = 4
+    drop_history_after_layer: int = -4
 
     @nn.compact
-    def __call__(self, x, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, deterministic=True, frame_mask=None):  # noqa: FBT002
         out = {}
+        k = self.num_timesteps
+        use_video = k > 1
 
-        if self.scan:
+        if not use_video and self.scan:
             block = nn.remat(
                 Encoder1DBlock,
                 prevent_cse=False,
@@ -146,17 +235,40 @@ class Encoder(nn.Module):
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
         else:
-            # Input Encoder
+            if use_video and self.temporal_attn_every < 1:
+                raise ValueError("temporal_attn_every must be positive")
+            drop_after = (
+                self.depth + self.drop_history_after_layer
+                if self.drop_history_after_layer < 0
+                else self.drop_history_after_layer
+            )
+            if use_video and not 0 <= drop_after < self.depth:
+                raise ValueError(f"drop_history_after_layer resolves to {drop_after}")
             for lyr in range(self.depth):
-                block_cur = Encoder1DBlock(
-                    name=f"encoderblock_{lyr}",
-                    dtype_mm=self.dtype_mm,
-                    mlp_dim=self.mlp_dim,
-                    num_heads=self.num_heads,
-                    dropout=self.dropout,
-                )
-                x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
-            out["pre_ln"] = x  # Alias for last block, but without the number in it.
+                if use_video and lyr % self.temporal_attn_every == 0:
+                    block_cur = SpaceTimeSeparableBlock(
+                        name=f"encoderblock_{lyr}",
+                        dtype_mm=self.dtype_mm,
+                        mlp_dim=self.mlp_dim,
+                        num_heads=self.num_heads,
+                        dropout=self.dropout,
+                        num_timesteps=k,
+                    )
+                    x, out[f"block{lyr:02d}"] = block_cur(x, deterministic, frame_mask=frame_mask)
+                else:
+                    block_cur = Encoder1DBlock(
+                        name=f"encoderblock_{lyr}",
+                        dtype_mm=self.dtype_mm,
+                        mlp_dim=self.mlp_dim,
+                        num_heads=self.num_heads,
+                        dropout=self.dropout,
+                    )
+                    x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
+                if use_video and lyr == drop_after:
+                    bk, n, d = x.shape
+                    x = x.reshape(bk // k, k, n, d)[:, -1]
+                    use_video = False
+            out["pre_ln"] = x
 
         return nn.LayerNorm(name="encoder_norm", dtype=self.dtype_mm)(x), out
 
@@ -203,9 +315,12 @@ class _Module(nn.Module):
     # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    num_timesteps: int = 1
+    temporal_attn_every: int = 4
+    drop_history_after_layer: int = -4
 
     @nn.compact
-    def __call__(self, image, *, train=False):
+    def __call__(self, image, *, train=False, frame_mask=None):
         out = {}
 
         # Kevin edit: do patch extraction and posemb in float32,
@@ -246,8 +361,11 @@ class _Module(nn.Module):
             scan=self.scan,
             remat_policy=self.remat_policy,
             dtype_mm=self.dtype_mm,
+            num_timesteps=self.num_timesteps,
+            temporal_attn_every=self.temporal_attn_every,
+            drop_history_after_layer=self.drop_history_after_layer,
             name="Transformer",
-        )(x, deterministic=not train)
+        )(x, deterministic=not train, frame_mask=frame_mask)
         encoded = out["encoded"] = x
 
         if self.pool_type == "map":
@@ -268,7 +386,8 @@ class _Module(nn.Module):
         else:
             raise ValueError(f"Unknown pool type: '{self.pool_type}'")
 
-        x_2d = jnp.reshape(encoded, [n, h, w, -1])
+        # 历史 token 可能已丢弃, 因此使用实际 batch 维。
+        x_2d = jnp.reshape(encoded, [encoded.shape[0], h, w, -1])
 
         if self.rep_size:
             rep_size = self.width if self.rep_size is True else self.rep_size

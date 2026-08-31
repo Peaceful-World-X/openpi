@@ -98,7 +98,20 @@ class RepackTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        result = jax.tree.map(lambda k: flat_item[k], self.structure)
+        # 旧 repack 映射不知道 MEM 字段, 必须显式保留。
+        for key in (
+            "image_history",
+            "image_history_masks",
+            "image_history_mask",
+            "state_history",
+            "language_memory",
+            "tokenized_memory",
+            "tokenized_memory_mask",
+        ):
+            if data.get(key) is not None and key not in result:
+                result[key] = data[key]
+        return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,12 +140,17 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
-        return apply_tree(
+        result = apply_tree(
             data,
             self.norm_stats,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
+        # 历史状态与当前 state 共用统计量。
+        if result.get("state_history") is not None and "state" in self.norm_stats:
+            fn = self._normalize_quantile if self.use_quantiles else self._normalize
+            result["state_history"] = fn(result["state_history"], self.norm_stats["state"])
+        return result
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
@@ -332,6 +350,8 @@ class PadStatesAndActions(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        if data.get("state_history") is not None:
+            data["state_history"] = pad_to_dim(data["state_history"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
         return data
@@ -458,3 +478,109 @@ def _assert_quantile_stats(norm_stats: at.PyTree[NormStats]) -> None:
             raise ValueError(
                 f"quantile stats must be provided if use_quantile_norm is True. Key {k} is missing q01 or q99."
             )
+
+
+@dataclasses.dataclass(frozen=True)
+class VideoFrameStack(DataTransformFn):
+    """校验 MEM 数据集产生的 K-1 历史帧。"""
+
+    num_frames: int = 6
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.num_frames, int) or isinstance(self.num_frames, bool) or self.num_frames < 1:
+            raise ValueError("VideoFrameStack num_frames must be positive")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        expected = self.num_frames - 1
+        history = data.get("image_history")
+        if history is not None:
+            for key, frames in history.items():
+                shape = np.asarray(frames).shape
+                if len(shape) < 4 or shape[-4] != expected:
+                    raise ValueError(f"image_history[{key!r}] must contain {expected} frames, got {shape}")
+        masks = data.get("image_history_masks", data.get("image_history_mask"))
+        if masks is not None:
+            if history is None or set(masks) != set(history):
+                raise ValueError("image history and masks must have matching camera keys")
+            for key, mask in masks.items():
+                if np.asarray(mask).shape[-1] != expected:
+                    raise ValueError(f"image_history_masks[{key!r}] must have length {expected}")
+        if data.get("state_history") is not None:
+            shape = np.asarray(data["state_history"]).shape
+            if len(shape) < 2 or shape[-2] != expected:
+                raise ValueError(f"state_history must contain {expected} states, got {shape}")
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeMemory(DataTransformFn):
+    """将 language_memory 转为固定长度 token/mask。"""
+
+    tokenizer: object
+    max_len: int = 256
+
+    def __post_init__(self) -> None:
+        if self.max_len < 1:
+            raise ValueError("TokenizeMemory max_len must be positive")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        result = dict(data)
+        token_value = result.get("tokenized_memory")
+        mask_value = result.get("tokenized_memory_mask")
+        has_tokens = token_value is not None
+        has_mask = mask_value is not None
+        if has_tokens != has_mask:
+            raise ValueError("tokenized_memory and tokenized_memory_mask must be provided together")
+        if has_tokens:
+            result.pop("language_memory", None)
+            supplied_tokens = np.asarray(token_value, dtype=np.int32).reshape(-1)
+            supplied_mask = np.asarray(mask_value, dtype=np.bool_).reshape(-1)
+            if supplied_tokens.shape != supplied_mask.shape:
+                raise ValueError("tokenized_memory and tokenized_memory_mask must have matching lengths")
+            supplied_tokens = supplied_tokens[: self.max_len]
+            supplied_mask = supplied_mask[: self.max_len]
+            # 外部 token 也必须重新固定形状, 否则不同 step 会触发 JAX retracing。
+            tokens = np.zeros(self.max_len, dtype=np.int32)
+            mask = np.zeros(self.max_len, dtype=np.bool_)
+            tokens[: len(supplied_tokens)] = supplied_tokens
+            mask[: len(supplied_mask)] = supplied_mask
+            result["tokenized_memory"] = tokens
+            result["tokenized_memory_mask"] = mask
+            return result
+        result.pop("tokenized_memory", None)
+        result.pop("tokenized_memory_mask", None)
+        text = result.pop("language_memory", "")
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", errors="replace")
+        if isinstance(text, np.ndarray):
+            text = text.item() if text.ndim == 0 else str(text.tolist())
+        text = str(text or "")
+        if not text.strip():
+            result["tokenized_memory"] = np.zeros(self.max_len, dtype=np.int32)
+            result["tokenized_memory_mask"] = np.zeros(self.max_len, dtype=np.bool_)
+            return result
+        supplied_mask = None
+        if hasattr(self.tokenizer, "tokenize"):
+            encoded = self.tokenizer.tokenize(text)
+            if isinstance(encoded, tuple):
+                encoded, supplied_mask = encoded[0], encoded[1] if len(encoded) > 1 else None
+        elif hasattr(self.tokenizer, "encode"):
+            encoded = self.tokenizer.encode(text)
+        elif callable(self.tokenizer):
+            encoded = self.tokenizer(text)
+            if isinstance(encoded, tuple):
+                encoded, supplied_mask = encoded[0], encoded[1] if len(encoded) > 1 else None
+        else:
+            raise TypeError("memory tokenizer must provide tokenize(), encode(), or be callable")
+        ids = np.asarray(encoded, dtype=np.int32).reshape(-1)[: self.max_len]
+        tokens = np.zeros(self.max_len, dtype=np.int32)
+        mask = np.zeros(self.max_len, dtype=np.bool_)
+        tokens[: len(ids)] = ids
+        if supplied_mask is None:
+            mask[: len(ids)] = True
+        else:
+            valid = np.asarray(supplied_mask, dtype=np.bool_).reshape(-1)[: self.max_len]
+            mask[: min(len(valid), len(ids))] = valid[: len(ids)]
+        result["tokenized_memory"] = tokens
+        result["tokenized_memory_mask"] = mask
+        return result

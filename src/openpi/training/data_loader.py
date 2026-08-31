@@ -12,8 +12,10 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.models.pi0_config as pi0_config
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.mem_dataset import MEMLeRobotDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -128,7 +130,7 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig, *, use_mem: bool = False
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -144,6 +146,23 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+
+    if use_mem and isinstance(model_config, pi0_config.Pi0Config):
+        mem = model_config.mem
+        if mem.use_video_memory or mem.use_state_history or mem.use_language_memory:
+            memory = data_config.memory
+            frames = mem.video_memory_frames if (mem.use_video_memory or mem.use_state_history) else 1
+            dataset = MEMLeRobotDataset(
+                dataset,
+                num_frames=frames,
+                frame_stride_sec=mem.video_frame_stride_sec,
+                image_key_map=memory.image_key_map,
+                state_key=memory.state_key,
+                memory_label_path=memory.memory_label_path,
+                include_video_history=mem.use_video_memory,
+                include_state_history=mem.use_state_history,
+                include_language_memory=mem.use_language_memory,
+            )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -242,7 +261,18 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    if framework == "pytorch" and isinstance(config.model, pi0_config.Pi0Config):
+        mem = config.model.mem
+        if mem.use_video_memory or mem.use_state_history or mem.use_language_memory:
+            raise NotImplementedError("MEM is currently supported only by the JAX Pi0/Pi05 path")
+
     if data_config.rlds_data_dir is not None:
+        if isinstance(config.model, pi0_config.Pi0Config) and (
+            config.model.mem.use_video_memory
+            or config.model.mem.use_state_history
+            or config.model.mem.use_language_memory
+        ):
+            raise NotImplementedError("MEM history sampling is not implemented for RLDS datasets")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -299,7 +329,7 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = create_torch_dataset(data_config, action_horizon, model_config, use_mem=framework == "jax")
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

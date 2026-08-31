@@ -62,6 +62,15 @@ class AssetsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class MEMDataConfig:
+    """LeRobot MEM 历史采样和离线语言标签配置。"""
+
+    image_key_map: dict[str, str] = dataclasses.field(default_factory=dict)
+    state_key: str = "observation.state"
+    memory_label_path: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
@@ -96,6 +105,8 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # 仅 LeRobot/JAX MEM 使用; RLDS 路径不会读取此字段。
+    memory: MEMDataConfig = dataclasses.field(default_factory=MEMDataConfig)
 
 
 class GroupFactory(Protocol):
@@ -111,30 +122,50 @@ class ModelTransformFactory(GroupFactory):
     default_prompt: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        mem = model_config.mem if isinstance(model_config, pi0_config.Pi0Config) else None
+
+        def with_mem(group: _transforms.Group) -> _transforms.Group:
+            if mem is None:
+                return group
+            extra: list[_transforms.DataTransformFn] = []
+            if mem.use_video_memory or mem.use_state_history:
+                extra.append(_transforms.VideoFrameStack(num_frames=mem.video_memory_frames))
+            if mem.use_language_memory:
+                extra.append(
+                    _transforms.TokenizeMemory(
+                        _tokenizer.PaligemmaTokenizer(mem.max_memory_tokens), mem.max_memory_tokens
+                    )
+                )
+            return group.push(inputs=extra)
+
         match model_config.model_type:
             case _model.ModelType.PI0:
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
+                return with_mem(
+                    _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizePrompt(
+                                _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            ),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                        ],
+                    )
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                            discrete_state_input=model_config.discrete_state_input,
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
+                return with_mem(
+                    _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizePrompt(
+                                _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                                discrete_state_input=model_config.discrete_state_input,
+                            ),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                        ],
+                    )
                 )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
