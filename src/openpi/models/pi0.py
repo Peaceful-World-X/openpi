@@ -44,6 +44,17 @@ def make_attn_mask(input_mask, mask_ar):
     return jnp.logical_and(attn_mask, valid_mask)
 
 
+def _combine_recap_velocities(conditional, unconditional, guidance_scale, use_advantage):
+    """按 CFG 公式组合速度; 未启用条件的样本保持无条件输出。"""
+    if conditional.shape != unconditional.shape:
+        raise ValueError("conditional and unconditional velocities must have identical shapes")
+    use_advantage = jnp.asarray(use_advantage, dtype=jnp.bool_)
+    if use_advantage.shape != conditional.shape[:1]:
+        raise ValueError("use_advantage must contain one flag per batch element")
+    guided = unconditional + guidance_scale * (conditional - unconditional)
+    return jnp.where(use_advantage[:, None, None], guided, unconditional)
+
+
 @at.typecheck
 def posemb_sincos(
     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
@@ -67,6 +78,11 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        # RECAP 仅在显式开启时追加条件 token, 关闭时保持原有参数和推理路径。
+        self.recap_enabled = config.recap.enabled
+        self.recap_alpha = config.recap.alpha
+        self.recap_advantage_dropout_prob = config.recap.advantage_dropout_prob
+        self.recap_guidance_scale = config.recap.guidance_scale
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -131,6 +147,29 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+        if self.recap_enabled:
+            recap_fields = {
+                "advantage_indicator": obs.advantage_indicator,
+                "use_advantage": obs.use_advantage,
+                "tokenized_advantage_positive": obs.tokenized_advantage_positive,
+                "tokenized_advantage_negative": obs.tokenized_advantage_negative,
+                "tokenized_advantage_mask": obs.tokenized_advantage_mask,
+            }
+            missing = [name for name, value in recap_fields.items() if value is None]
+            if missing:
+                # 开启 RECAP 时推理也必须显式提供条件, 防止误用成普通无条件策略。
+                raise ValueError(f"RECAP prefix requires observation fields: {', '.join(missing)}")
+            # 正负文本共用语言 embedding; dropout 时用 mask 屏蔽整个条件块。
+            advantage_ids = jnp.where(
+                obs.advantage_indicator[..., None],
+                obs.tokenized_advantage_positive,
+                obs.tokenized_advantage_negative,
+            )
+            advantage_tokens = self.PaliGemma.llm(advantage_ids, method="embed")
+            advantage_mask = jnp.logical_and(obs.tokenized_advantage_mask, obs.use_advantage[..., None])
+            tokens.append(advantage_tokens)
+            input_mask.append(advantage_mask)
+            ar_mask += [False] * advantage_tokens.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -189,6 +228,14 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        # 在公共 model.compute_loss 内路由, 使所有 JAX trainer 调用都不会绕过 RECAP。
+        if self.recap_enabled:
+            return self.compute_recap_loss(rng, observation, actions, train=train)
+        return self._flow_matching_loss(rng, observation, actions, train=train)
+
+    def _flow_matching_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -213,6 +260,36 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    def compute_recap_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        """计算 RECAP 无条件和优势条件 flow-matching loss, 并应用 CFG dropout。"""
+        required_fields = (
+            "advantage_indicator",
+            "use_advantage",
+            "tokenized_advantage_positive",
+            "tokenized_advantage_negative",
+            "tokenized_advantage_mask",
+        )
+        missing = [field for field in required_fields if getattr(observation, field) is None]
+        if missing:
+            # 开启 RECAP 却缺少 sidecar 时必须失败, 避免静默退化成普通 BC 训练。
+            raise ValueError(f"RECAP loss requires observation fields: {', '.join(missing)}")
+        dropout_rng, unconditional_rng, conditional_rng = jax.random.split(rng, 3)
+        batch_size = actions.shape[0]
+        keep = (
+            jax.random.bernoulli(
+                dropout_rng, p=1.0 - self.recap_advantage_dropout_prob, shape=(batch_size,)
+            )
+            if train
+            else jnp.ones((batch_size,), dtype=jnp.bool_)
+        )
+        unconditional = observation.replace(use_advantage=jnp.zeros((batch_size,), dtype=jnp.bool_))
+        conditional = observation.replace(use_advantage=jnp.logical_and(observation.use_advantage, keep))
+        unconditional_loss = self._flow_matching_loss(unconditional_rng, unconditional, actions, train=train)
+        conditional_loss = self._flow_matching_loss(conditional_rng, conditional, actions, train=train)
+        return unconditional_loss + self.recap_alpha * conditional_loss
+
     @override
     def sample_actions(
         self,
@@ -221,8 +298,11 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        advantage_guidance_scale: float | at.Float[at.Array, ""] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
+        if advantage_guidance_scale is None:
+            advantage_guidance_scale = self.recap_guidance_scale
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
@@ -230,43 +310,63 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        def encode_prefix(prefix_observation):
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(prefix_observation)
+            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            _, prefix_cache = self.PaliGemma.llm(
+                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+            )
+            return prefix_tokens, prefix_mask, prefix_cache
 
-        def step(carry):
-            x_t, time = carry
+        # RECAP beta!=1 时额外缓存无条件 prefix; 普通模型仍只有一次 prefix 前向。
+        prefix_tokens, prefix_mask, kv_cache = encode_prefix(observation)
+        use_guidance = self.recap_enabled and not (
+            isinstance(advantage_guidance_scale, int | float) and float(advantage_guidance_scale) == 1.0
+        )
+        if use_guidance:
+            unconditional_observation = observation.replace(
+                use_advantage=jnp.zeros_like(observation.use_advantage, dtype=jnp.bool_)
+            )
+            unconditional_tokens, unconditional_mask, unconditional_cache = encode_prefix(unconditional_observation)
+
+        def denoise(prefix_tokens, prefix_mask, prefix_cache, x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
                 positions=positions,
-                kv_cache=kv_cache,
+                kv_cache=prefix_cache,
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        def step(carry):
+            x_t, time = carry
+            v_t = denoise(prefix_tokens, prefix_mask, kv_cache, x_t, time)
+            if use_guidance:
+                unconditional_v = denoise(
+                    unconditional_tokens, unconditional_mask, unconditional_cache, x_t, time
+                )
+                # 对显式 use_advantage=False 的样本返回无条件策略, 避免 CFG 意外重新启用条件。
+                v_t = _combine_recap_velocities(
+                    v_t,
+                    unconditional_v,
+                    advantage_guidance_scale,
+                    observation.use_advantage,
+                )
 
             return x_t + dt * v_t, time + dt
 

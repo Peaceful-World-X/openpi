@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import functools
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
@@ -14,6 +15,42 @@ from openpi.shared import normalize as _normalize
 
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
+
+# RECAP sidecar 字段不是机器人观测, 但必须穿过各硬件适配器进入模型 token transform。
+RECAP_FIELDS = ("advantage_indicator", "use_advantage", "is_human_intervention")
+RECAP_CANONICAL_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+
+
+def copy_recap_fields(source: Mapping[str, object], target: dict) -> dict:
+    """将可选 RECAP sidecar 字段透传到适配器输出, 保持普通数据 schema 不变。"""
+    for key in RECAP_FIELDS:
+        if key in source:
+            target[key] = source[key]
+    return target
+
+
+def canonicalize_recap_image(image: object, *, key: str) -> np.ndarray:
+    """统一 LeRobot 图像的 CHW/HWC 和数值范围, 防止 SigLIP 收到错误布局。"""
+    if hasattr(image, "detach"):
+        image = image.detach().cpu().numpy()
+    image = np.asarray(image)
+    if image.ndim != 3:
+        raise ValueError(f"RECAP image {key!r} must be a 3-D array, got {image.shape}")
+    if image.shape[0] == 3 and image.shape[-1] != 3:
+        image = np.transpose(image, (1, 2, 0))
+    if image.shape[-1] != 3:
+        raise ValueError(f"RECAP image {key!r} must be HWC/CHW RGB, got {image.shape}")
+    if image.dtype == np.uint8:
+        return image
+    if not np.issubdtype(image.dtype, np.floating) or not np.all(np.isfinite(image)):
+        raise ValueError(f"RECAP image {key!r} must contain finite uint8 or floating-point values")
+    minimum, maximum = float(np.min(image)), float(np.max(image))
+    if minimum >= -1.001 and maximum <= 1.001:
+        # LeRobot 常见的 float 图像是 [0, 1], 而 canonical OpenPI 图像要求 [-1, 1]。
+        return (image * 2.0 - 1.0 if minimum >= -1e-6 else image).astype(np.float32)
+    if minimum >= 0.0 and maximum <= 255.0:
+        return (image / 255.0 * 2.0 - 1.0).astype(np.float32)
+    raise ValueError(f"RECAP image {key!r} must be in [0, 1], [-1, 1], or [0, 255], got [{minimum}, {maximum}]")
 
 
 T = TypeVar("T")
@@ -67,7 +104,15 @@ class CompositeTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         for transform in self.transforms:
+            source_recap = (
+                {key: data[key] for key in RECAP_FIELDS if key in data}
+                if isinstance(data, Mapping)
+                else {}
+            )
             data = transform(data)
+            if isinstance(data, dict):
+                # 任意机器人适配器都可能重建 dict; 在统一组合边界保留可选 sidecar。
+                copy_recap_fields(source_recap, data)
         return data
 
 
@@ -102,6 +147,55 @@ class RepackTransform(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class ReCAPLeRobotInputs(DataTransformFn):
+    """将明确约定的 LeRobot 列转换为 Pi0/Pi05 canonical 输入。"""
+
+    image_keys: tuple[str, ...] = RECAP_CANONICAL_IMAGE_KEYS
+    image_column_prefix: str = "observation.images."
+    state_key: str = "observation.state"
+    action_key: str = "action"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        canonical_images = data.get("image")
+        if isinstance(canonical_images, Mapping):
+            images = {key: canonical_images[key] for key in self.image_keys if key in canonical_images}
+        else:
+            images = {
+                key: data[f"{self.image_column_prefix}{key}"]
+                for key in self.image_keys
+                if f"{self.image_column_prefix}{key}" in data
+            }
+        missing_images = [key for key in self.image_keys if key not in images]
+        if missing_images:
+            raise ValueError(
+                "RECAP LeRobot data is missing canonical camera columns for "
+                f"{missing_images}; provide a robot-specific TrainConfig instead of guessing camera semantics"
+            )
+        state = data.get("state", data.get(self.state_key))
+        actions = data.get("actions", data.get(self.action_key))
+        if state is None:
+            raise ValueError(f"RECAP data requires state or {self.state_key!r}")
+        raw_masks = data.get("image_mask", {})
+        if raw_masks is None:
+            raw_masks = {}
+        if not isinstance(raw_masks, Mapping):
+            raise TypeError("canonical image_mask must be a mapping")
+        result = {
+            "image": {key: canonicalize_recap_image(images[key], key=key) for key in self.image_keys},
+            "image_mask": {
+                key: np.asarray(raw_masks.get(key, True), dtype=np.bool_) for key in self.image_keys
+            },
+            "state": state,
+        }
+        # 推理 observation 没有 action; 训练样本存在时再透传。
+        if actions is not None:
+            result["actions"] = actions
+        if "prompt" in data:
+            result["prompt"] = data["prompt"]
+        return copy_recap_fields(data, result)
+
+
+@dataclasses.dataclass(frozen=True)
 class InjectDefaultPrompt(DataTransformFn):
     prompt: str | None
 
@@ -109,6 +203,19 @@ class InjectDefaultPrompt(DataTransformFn):
         if self.prompt is not None and "prompt" not in data:
             data["prompt"] = np.asarray(self.prompt)
         return data
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectReCAPInferenceCondition(DataTransformFn):
+    """为已训练 RECAP 策略注入默认 positive 条件, 不参与训练数据处理。"""
+
+    def __call__(self, data: DataDict) -> DataDict:
+        result = dict(data)
+        # 部署默认采样改进策略; 调用方仍可显式传 False 获取 negative 或无条件输出。
+        result.setdefault("advantage_indicator", np.ones((), dtype=np.bool_))
+        result.setdefault("use_advantage", np.ones((), dtype=np.bool_))
+        result.setdefault("is_human_intervention", np.zeros((), dtype=np.bool_))
+        return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -264,6 +371,54 @@ class TokenizePrompt(DataTransformFn):
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeReCAPAdvantage(DataTransformFn):
+    """把固定正负优势描述编码为 token, 供 Pi0/Pi05 的 prefix 使用。"""
+
+    tokenizer: _tokenizer.PaligemmaTokenizer
+    max_len: int = 8
+
+    def __post_init__(self) -> None:
+        if self.max_len < 1:
+            raise ValueError("RECAP advantage token length must be positive")
+
+    @functools.cached_property
+    def _condition_tokens(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """固定文本每个 worker 只编码一次, 避免逐帧重复调用 tokenizer。"""
+        positive, positive_mask = self.tokenizer.tokenize("Advantage: positive")
+        negative, negative_mask = self.tokenizer.tokenize("Advantage: negative")
+
+        def fixed(tokens, mask):
+            tokens = np.asarray(tokens, dtype=np.int32).reshape(-1)[: self.max_len]
+            mask = np.asarray(mask, dtype=np.bool_).reshape(-1)[: self.max_len]
+            if len(tokens) < self.max_len:
+                pad = self.max_len - len(tokens)
+                tokens = np.pad(tokens, (0, pad))
+                mask = np.pad(mask, (0, pad), constant_values=False)
+            return tokens, mask
+
+        positive, positive_mask = fixed(positive, positive_mask)
+        negative, negative_mask = fixed(negative, negative_mask)
+        if not np.array_equal(positive_mask, negative_mask):
+            # Observation 契约只有一个条件 mask; 长度不一致时必须失败, 不能 OR 后放开 padding。
+            raise ValueError("positive and negative RECAP conditions must have identical token masks")
+        return positive, negative, positive_mask
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "advantage_indicator" not in data:
+            return data
+        positive, negative, advantage_mask = self._condition_tokens
+        result = dict(data)
+        result["tokenized_advantage_positive"] = positive
+        result["tokenized_advantage_negative"] = negative
+        result["tokenized_advantage_mask"] = advantage_mask
+        if "use_advantage" not in result:
+            result["use_advantage"] = np.ones((), dtype=np.bool_)
+        if "is_human_intervention" not in result:
+            result["is_human_intervention"] = np.zeros((), dtype=np.bool_)
+        return result
 
 
 @dataclasses.dataclass(frozen=True)

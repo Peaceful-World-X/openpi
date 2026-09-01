@@ -62,6 +62,72 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class ReCAPFieldsDataset(Dataset):
+    """读取 RECAP sidecar, 并逐帧核对 LeRobot episode/frame 身份。"""
+
+    REQUIRED_FIELDS = ("advantage_indicator", "use_advantage", "is_human_intervention")
+    IDENTITY_FIELDS = ("episode_index", "frame_index")
+
+    def __init__(self, dataset: Dataset, fields_path: str | os.PathLike[str]):
+        self._dataset = dataset
+        with np.load(fields_path, allow_pickle=False) as fields:
+            missing = [name for name in (*self.REQUIRED_FIELDS, *self.IDENTITY_FIELDS) if name not in fields]
+            if missing:
+                raise ValueError(f"RECAP sidecar missing required fields: {missing}")
+            self._fields = {}
+            for name in self.REQUIRED_FIELDS:
+                value = np.asarray(fields[name])
+                if value.dtype != np.bool_:
+                    raise TypeError(f"RECAP sidecar field {name!r} must have bool dtype, got {value.dtype}")
+                if value.ndim != 1:
+                    raise ValueError(f"RECAP sidecar field {name!r} must be 1-D, got {value.shape}")
+                self._fields[name] = value.copy()
+            episode_index = np.asarray(fields["episode_index"])
+            frame_index = np.asarray(fields["frame_index"])
+            if episode_index.ndim != 1 or episode_index.dtype.kind not in "iu":
+                raise TypeError("RECAP sidecar episode_index must be a one-dimensional integer array")
+            if frame_index.ndim != 1 or frame_index.dtype.kind not in "iu":
+                raise TypeError("RECAP sidecar frame_index must be a one-dimensional integer array")
+            self._episode_indices = episode_index.astype(np.int64, copy=True)
+            self._frame_indices = frame_index.astype(np.int64, copy=True)
+        dataset_length = len(self._dataset)
+        for name, value in self._fields.items():
+            if len(value) != dataset_length:
+                # 每个字段都必须与 flattened frame 对齐, 否则只检查第一个字段会静默错位。
+                raise ValueError(
+                    f"RECAP sidecar field {name!r} length {len(value)} does not match dataset length {dataset_length}"
+                )
+        if len(self._episode_indices) != dataset_length or len(self._frame_indices) != dataset_length:
+            raise ValueError("RECAP sidecar identity fields must match dataset length")
+
+    @staticmethod
+    def _scalar(value):
+        if hasattr(value, "item"):
+            value = value.item()
+        return value
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        index = index.__index__()
+        item = dict(self._dataset[index])
+        actual_episode = item.get("episode_index")
+        actual_frame = item.get("frame_index")
+        if actual_episode is None or actual_frame is None:
+            raise ValueError("RECAP training data must expose LeRobot episode_index and frame_index")
+        actual_episode = int(self._scalar(actual_episode))
+        actual_frame = int(self._scalar(actual_frame))
+        if actual_episode != int(self._episode_indices[index]) or actual_frame != int(self._frame_indices[index]):
+            raise ValueError(
+                "RECAP sidecar frame identity mismatch at flattened index "
+                f"{index}: dataset=({actual_episode}, {actual_frame}), "
+                f"sidecar=({int(self._episode_indices[index])}, {int(self._frame_indices[index])})"
+            )
+        item.update({name: values[index] for name, values in self._fields.items()})
+        return item
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -100,9 +166,12 @@ class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples
         self._observation_spec, self._action_spec = model_config.inputs_spec()
+        recap = getattr(model_config, "recap", None)
+        self._recap_enabled = recap is not None and recap.enabled
 
     def __getitem__(self, index: SupportsIndex) -> dict:
-        rng = jax.random.key(index.__index__())
+        sample_index = index.__index__()
+        rng = jax.random.key(sample_index)
 
         def make_from_spec(spec: jax.ShapeDtypeStruct):
             nonlocal rng
@@ -118,10 +187,19 @@ class FakeDataset(Dataset):
         observation = jax.tree.map(make_from_spec, self._observation_spec)
         action = jax.tree.map(make_from_spec, self._action_spec)
 
-        return {
+        result = {
             **observation.to_dict(),
             "actions": action,
         }
+        if self._recap_enabled:
+            # bool spec 默认全 False; smoke 必须显式打开条件并覆盖正负两类样本。
+            result["advantage_indicator"] = np.asarray(sample_index % 2 == 0, dtype=np.bool_)
+            result["use_advantage"] = np.ones((), dtype=np.bool_)
+            result["is_human_intervention"] = np.zeros((), dtype=np.bool_)
+            # 提供稳定身份, 使显式 fake sidecar 也能经过与真实 LeRobot 相同的对齐校验。
+            result["episode_index"] = np.asarray(0, dtype=np.int64)
+            result["frame_index"] = np.asarray(sample_index, dtype=np.int64)
+        return result
 
     def __len__(self) -> int:
         return self._num_samples
@@ -135,7 +213,10 @@ def create_torch_dataset(
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
-        return FakeDataset(model_config, num_samples=1024)
+        dataset = FakeDataset(model_config, num_samples=1024)
+        if data_config.recap_fields_path is not None:
+            return ReCAPFieldsDataset(dataset, data_config.recap_fields_path)
+        return dataset
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -147,6 +228,9 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    if data_config.recap_fields_path is not None:
+        dataset = ReCAPFieldsDataset(dataset, data_config.recap_fields_path)
 
     return dataset
 
@@ -240,6 +324,13 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    recap_config = getattr(config.model, "recap", None)
+    if data_config.recap_fields_path is not None and (recap_config is None or not recap_config.enabled):
+        # sidecar 只对开启 RECAP 的模型有效, 否则额外字段会与旧模型输入树不一致。
+        raise ValueError("data.recap_fields_path requires model.recap.enabled=True")
+    if data_config.rlds_data_dir is not None and data_config.recap_fields_path is not None:
+        # 当前 sidecar 身份契约基于 LeRobot episode/frame, RLDS 不能静默忽略标签。
+        raise NotImplementedError("RECAP sidecar loading currently supports LeRobot datasets only, not RLDS")
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:

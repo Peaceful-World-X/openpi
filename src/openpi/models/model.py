@@ -106,12 +106,28 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # RECAP 条件训练字段保持可选, 默认数据集无需新增列即可复用原模型。
+    advantage_indicator: at.Bool[ArrayT, "*b"] | None = None
+    use_advantage: at.Bool[ArrayT, "*b"] | None = None
+    is_human_intervention: at.Bool[ArrayT, "*b"] | None = None
+    tokenized_advantage_positive: at.Int[ArrayT, "*b adv_l"] | None = None
+    tokenized_advantage_negative: at.Int[ArrayT, "*b adv_l"] | None = None
+    tokenized_advantage_mask: at.Bool[ArrayT, "*b adv_l"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        recap_token_keys = (
+            "tokenized_advantage_positive",
+            "tokenized_advantage_negative",
+            "tokenized_advantage_mask",
+        )
+        recap_tokens = [data.get(key) for key in recap_token_keys]
+        if any(value is not None for value in recap_tokens) and not all(value is not None for value in recap_tokens):
+            raise ValueError("tokenized RECAP fields must be supplied together")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -126,6 +142,12 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            advantage_indicator=data.get("advantage_indicator"),
+            use_advantage=data.get("use_advantage"),
+            is_human_intervention=data.get("is_human_intervention"),
+            tokenized_advantage_positive=data.get("tokenized_advantage_positive"),
+            tokenized_advantage_negative=data.get("tokenized_advantage_negative"),
+            tokenized_advantage_mask=data.get("tokenized_advantage_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -133,6 +155,17 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        # 关闭 RECAP 时不向旧数据管线注入一组 None 字段, 保持默认 schema 稳定。
+        for key in (
+            "advantage_indicator",
+            "use_advantage",
+            "is_human_intervention",
+            "tokenized_advantage_positive",
+            "tokenized_advantage_negative",
+            "tokenized_advantage_mask",
+        ):
+            if result[key] is None:
+                result.pop(key)
         return result
 
 
@@ -205,6 +238,12 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        advantage_indicator=observation.advantage_indicator,
+        use_advantage=observation.use_advantage,
+        is_human_intervention=observation.is_human_intervention,
+        tokenized_advantage_positive=observation.tokenized_advantage_positive,
+        tokenized_advantage_negative=observation.tokenized_advantage_negative,
+        tokenized_advantage_mask=observation.tokenized_advantage_mask,
     )
 
 

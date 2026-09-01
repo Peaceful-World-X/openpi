@@ -48,6 +48,10 @@ def create_trained_policy(
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
+    recap = getattr(train_config.model, "recap", None)
+    if is_pytorch and recap is not None and recap.enabled:
+        # PyTorch 模型尚未消费 advantage token, 部署时也必须拒绝静默无条件推理。
+        raise NotImplementedError("RECAP policy inference currently supports JAX checkpoints only")
 
     logging.info("Loading model...")
     if is_pytorch:
@@ -62,6 +66,11 @@ def create_trained_policy(
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+
+    # 训练必须从 sidecar 读取标签; 只有部署入口才默认请求 positive advantage 策略。
+    recap_inference_transforms = (
+        [transforms.InjectReCAPInferenceCondition()] if recap is not None and recap.enabled else []
+    )
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
@@ -79,6 +88,7 @@ def create_trained_policy(
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *recap_inference_transforms,
             *data_config.model_transforms.inputs,
         ],
         output_transforms=[

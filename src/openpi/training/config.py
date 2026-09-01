@@ -90,6 +90,9 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # RECAP 标签 sidecar; 按 LeRobot 展平帧顺序读取, 不修改原始 parquet/video。
+    recap_fields_path: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -111,9 +114,22 @@ class ModelTransformFactory(GroupFactory):
     default_prompt: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        recap = getattr(model_config, "recap", None)
+
+        def with_recap(group: _transforms.Group) -> _transforms.Group:
+            if recap is None or not recap.enabled:
+                return group
+            return group.push(
+                inputs=[
+                    _transforms.TokenizeReCAPAdvantage(
+                        _tokenizer.PaligemmaTokenizer(max_len=8), max_len=8
+                    )
+                ]
+            )
+
         match model_config.model_type:
             case _model.ModelType.PI0:
-                return _transforms.Group(
+                return with_recap(_transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
@@ -122,10 +138,10 @@ class ModelTransformFactory(GroupFactory):
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
-                )
+                ))
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                return _transforms.Group(
+                return with_recap(_transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
@@ -135,7 +151,7 @@ class ModelTransformFactory(GroupFactory):
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
-                )
+                ))
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -167,6 +183,8 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # RECAP 标签 sidecar; 通过 CLI 传入后与 LeRobot 展平帧一一对应。
+    recap_fields_path: str | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -179,12 +197,16 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        base_config = self.base_config or DataConfig()
         return dataclasses.replace(
-            self.base_config or DataConfig(),
+            base_config,
             repo_id=repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            recap_fields_path=(
+                self.recap_fields_path if self.recap_fields_path is not None else base_config.recap_fields_path
+            ),
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -206,7 +228,19 @@ class FakeDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        return DataConfig(repo_id=self.repo_id)
+        # fake 数据也支持 sidecar, 便于 CPU smoke test 覆盖完整 RECAP 字段链路。
+        model_transforms = _transforms.Group()
+        recap = getattr(model_config, "recap", None)
+        if recap is not None and recap.enabled:
+            # FakeDataset 已提供 tokenized_prompt, 这里只补真实的正负 RECAP 文本编码。
+            model_transforms = _transforms.Group(
+                inputs=[_transforms.TokenizeReCAPAdvantage(_tokenizer.PaligemmaTokenizer(max_len=8), max_len=8)]
+            )
+        return DataConfig(
+            repo_id=self.repo_id,
+            recap_fields_path=self.recap_fields_path,
+            model_transforms=model_transforms,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -964,6 +998,37 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_pi05_recap",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            recap=pi0_config.ReCAPConfig(enabled=True),
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=2,
+        overwrite=True,
+        exp_name="debug_pi05_recap",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_recap",
+        model=pi0_config.Pi0Config(pi05=True, recap=pi0_config.ReCAPConfig(enabled=True)),
+        # 明确转换标准 LeRobot 列; 相机语义不同的机器人必须提供自定义 TrainConfig。
+        data=SimpleDataConfig(
+            data_transforms=lambda _model_config: _transforms.Group(
+                inputs=[_transforms.ReCAPLeRobotInputs()]
+            ),
+            # 标准 LeRobot 的动作列名为 action, 必须覆盖通用配置的 actions 默认值。
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        # RECAP policy 应从官方 Pi05 权重微调; 用户可在自定义配置中替换为本地 checkpoint。
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        num_train_steps=30_000,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

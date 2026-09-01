@@ -1,4 +1,5 @@
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 import flax.nnx as nnx
@@ -13,6 +14,52 @@ import openpi.shared.nnx_utils as nnx_utils
 
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
+
+
+@dataclasses.dataclass(frozen=True)
+class ReCAPConfig:
+    """RECAP 条件训练参数; 默认关闭以保持普通 Pi0/Pi05 兼容。"""
+
+    enabled: bool = False
+    alpha: float = 1.0
+    advantage_dropout_prob: float = 0.3
+    # CFG 只在 RECAP 推理时生效; beta=2 对齐论文建议范围和参考实现默认值。
+    guidance_scale: float = 2.0
+    positive_fraction: float = 0.4
+    value_bins: int = 201
+    value_min: float = -1.0
+    value_max: float = 0.0
+    n_step_lookahead: int = 50
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("RECAP enabled must be a bool")
+        if isinstance(self.alpha, bool) or not math.isfinite(self.alpha) or self.alpha < 0:
+            raise ValueError("RECAP alpha must be non-negative")
+        if (
+            isinstance(self.advantage_dropout_prob, bool)
+            or not math.isfinite(self.advantage_dropout_prob)
+            or not 0.0 <= self.advantage_dropout_prob <= 1.0
+        ):
+            raise ValueError("advantage_dropout_prob must be in [0, 1]")
+        if isinstance(self.guidance_scale, bool) or not math.isfinite(self.guidance_scale) or self.guidance_scale < 0:
+            raise ValueError("guidance_scale must be finite and non-negative")
+        if (
+            isinstance(self.positive_fraction, bool)
+            or not math.isfinite(self.positive_fraction)
+            or not 0.0 < self.positive_fraction <= 1.0
+        ):
+            raise ValueError("positive_fraction must be in (0, 1]")
+        if isinstance(self.value_bins, bool) or not isinstance(self.value_bins, int) or self.value_bins < 2:
+            raise ValueError("value_bins must be at least 2")
+        if not math.isfinite(self.value_min) or not math.isfinite(self.value_max) or self.value_min >= self.value_max:
+            raise ValueError("value_min must be smaller than value_max")
+        if (
+            isinstance(self.n_step_lookahead, bool)
+            or not isinstance(self.n_step_lookahead, int)
+            or self.n_step_lookahead < 1
+        ):
+            raise ValueError("n_step_lookahead must be >= 1")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,6 +78,8 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+
+    recap: ReCAPConfig = dataclasses.field(default_factory=ReCAPConfig)
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -80,6 +129,19 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                # 只在 RECAP 开启时扩展 pytree, 普通 Pi0/Pi05 的输入结构保持不变。
+                advantage_indicator=(jax.ShapeDtypeStruct([batch_size], jnp.bool_) if self.recap.enabled else None),
+                use_advantage=(jax.ShapeDtypeStruct([batch_size], jnp.bool_) if self.recap.enabled else None),
+                is_human_intervention=(jax.ShapeDtypeStruct([batch_size], jnp.bool_) if self.recap.enabled else None),
+                tokenized_advantage_positive=(
+                    jax.ShapeDtypeStruct([batch_size, 8], jnp.int32) if self.recap.enabled else None
+                ),
+                tokenized_advantage_negative=(
+                    jax.ShapeDtypeStruct([batch_size, 8], jnp.int32) if self.recap.enabled else None
+                ),
+                tokenized_advantage_mask=(
+                    jax.ShapeDtypeStruct([batch_size, 8], jnp.bool_) if self.recap.enabled else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

@@ -307,6 +307,9 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    # PyTorch 路径没有实现 RECAP 双路 loss, 这里显式拒绝避免悄悄退化为 BC。
+    if getattr(config.model, "recap", None) is not None and config.model.recap.enabled:
+        raise NotImplementedError("RECAP currently supports the JAX Pi0/Pi05 trainer only; PyTorch is intentionally rejected.")
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
