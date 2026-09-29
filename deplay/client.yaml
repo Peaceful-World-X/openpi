@@ -1,0 +1,78 @@
+server:
+  uri: ws://127.0.0.1:9000
+  timeout_s: 180.0
+  connect_timeout_s: 60.0
+  reconnect_attempts: 0
+
+debug:
+  enabled: false
+  log_path: .data/ur7_client.jsonl
+
+task: "pick the randomly placed housing, lift it, reorient it upright, then stand it stably on the table"
+
+control:
+  control_hz: 10.0
+  image_size: 224
+  action_space: absolute
+
+rtc:
+  enabled: true
+  action_chunk_size: 16
+  execute_horizon: 15
+  inference_delay_steps: 3
+  prefix_attention_schedule: exp
+  prefetch_remaining_steps: 3
+  rtc_overlap_steps: 2
+  pose_aware: false
+
+replay:
+  action_column: action
+  fallback_hz: 10.0
+  speed_scale: 1.0
+  move_to_first_target: true
+  initial_wait_s: 2.0
+  initial_move_duration_s: 1.5
+
+robot:
+  ip: 192.168.1.188
+  gripper_connection: 192.168.1.188:63352
+  state:
+    include_force_torque: true
+    include_velocity: true
+    include_joint_position: false
+    include_joint_velocity: false
+  servo:
+    acceleration: 0.5
+    velocity: 0.25
+    time_step: 0.1
+    lookahead_time: 0.1
+    gain: 300
+
+cameras:
+  base:
+    serial: "406122070987"
+    width: 640
+    height: 480
+    fps: 30
+  wrist:
+    serial: "047422071138"
+    width: 640
+    height: 480
+    fps: 30
+
+reset:
+  eef_pose: [0.20, -0.40, 0.35, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+  duration_s: 1
+  position_tolerance_m: 0.1      # 到达后允许的末端位置误差
+  rotation_tolerance_rad: 0.5    # 到达后允许的末端姿态角误差
+  gripper_open_wait_s: 0.5
+  gripper_open_min: 0          # 等待后要求夹爪打开比例至少
+
+home:
+  eef_pose: [0.20, -0.40, 0.35, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+safety:
+  max_translation_step_m: 0.1
+  max_rotation_step_rad: 1
+  # workspace_min: [-0.10, -0.65, 0.24]
+  # workspace_max: [0.27, -0.37, 0.44]

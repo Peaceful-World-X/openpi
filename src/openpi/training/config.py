@@ -5,7 +5,9 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
+import shlex
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -20,6 +22,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.ur7_policy as ur7_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -222,6 +225,55 @@ class SimpleDataConfig(DataConfigFactory):
             self.create_base_config(assets_dirs, model_config),
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUR7DataConfig(DataConfigFactory):
+    """适配 UR7 LeRobot v2.1 数据: 状态取前 22 维, 状态和动作均补零至 32 维。
+    归一化前将绝对位姿转为机体坐标系相对位姿, 夹爪保持绝对值; 输出时还原绝对动作。
+    """
+
+    # 样本缺少提示词时使用的默认文本。
+    default_prompt: str | None = None
+    # action[0:9] 在 UR7Inputs 中转换为当前 EEF 坐标系下的相对位姿.
+    relative_action_dims: tuple[int, ...] = tuple(range(9))
+    # action[9] 保持绝对值, 表示 gripper 开合状态.
+    absolute_action_dims: tuple[int, ...] = (9,)
+    # 数据集中的动作序列字段。
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.relative_action_dims != tuple(range(9)) or self.absolute_action_dims != (9,):
+            raise ValueError("UR7 action semantics are fixed: relative dims 0:9 and absolute gripper dim 9")
+        if model_config.action_dim != ur7_policy.MODEL_ACTION_DIM:
+            raise ValueError(
+                f"UR7 Pi05 config must use action_dim={ur7_policy.MODEL_ACTION_DIM}, got {model_config.action_dim}"
+            )
+        if model_config.action_horizon != 50:
+            raise ValueError(f"UR7 Pi05 config must use action_horizon=50, got {model_config.action_horizon}")
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "actions": "action",
+                            "image": "observation.images.base",
+                            "wrist_image": "observation.images.wrist",
+                            "task": "task",
+                        }
+                    )
+                ]
+            ),
+            data_transforms=_transforms.Group(
+                inputs=[ur7_policy.UR7Inputs(action_dim=model_config.action_dim)],
+                outputs=[ur7_policy.UR7Outputs(action_horizon=model_config.action_horizon)],
+            ),
+            model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -554,6 +606,78 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+
+# Shared full-fine-tuning definition for the fixed UR7 dataset.  Each public
+# H20 config below only overrides its hardware and training-budget parameters.
+def _ur7_h20_config(
+    *,
+    name: str,
+    fsdp_devices: int,
+    batch_size: int,
+    num_train_steps: int,
+    warmup_steps: int,
+    peak_lr: float,
+    decay_lr: float,
+    num_workers: int,
+    save_interval: int,
+    log_interval: int = 100,
+    wandb_enabled: bool = True,
+) -> TrainConfig:
+    # Read paths for direct train.py runs too; explicit environment/CLI values
+    # take precedence. Keep hyperparameters in the three presets below.
+    settings = {}
+    env_file = pathlib.Path(os.environ.get("OPENPI_ENV_FILE", pathlib.Path(__file__).resolve().parents[3] / ".env"))
+    if env_file.is_file():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.strip().partition("=")
+            key = key.removeprefix("export ").strip()
+            if separator and key.startswith("OPENPI_"):
+                values = shlex.split(value, comments=True)
+                if len(values) == 1:
+                    settings[key] = values[0]
+    settings.update(os.environ)
+    # This is the final dataset directory, without an extra archive-name suffix.
+    dataset_dir = settings.get("OPENPI_DATA_DIR") or "/data"
+    assets_dir = settings.get("OPENPI_ASSETS_DIR") or dataset_dir
+
+    return TrainConfig(
+        name=name,
+        project_name="openpi_ur7",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            dtype="bfloat16",
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotUR7DataConfig(
+            repo_id=dataset_dir,
+            relative_action_dims=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+            absolute_action_dims=(9,),
+            assets=AssetsConfig(
+                assets_dir=assets_dir,
+                asset_id="assets",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(settings.get("OPENPI_PARAMS_DIR") or "/ossfs/workspace/.models/openpi_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=warmup_steps,
+            peak_lr=peak_lr,
+            decay_steps=num_train_steps,
+            decay_lr=decay_lr,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.99,
+        log_interval=log_interval,
+        save_interval=save_interval,
+        keep_period=save_interval,
+        fsdp_devices=fsdp_devices,
+        num_train_steps=num_train_steps,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        wandb_enabled=wandb_enabled,
+        checkpoint_base_dir=settings.get("OPENPI_CHECKPOINT_DIR") or "/result",
+    )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -968,6 +1092,90 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    # H20-3E x8: recommended full fine-tuning run (7.68M sampled chunks).
+    _ur7_h20_config(
+        name="pi05_bund_20260917_n906_v21_new_80G_8gpu_full",
+        fsdp_devices=8,
+        batch_size=256,
+        num_train_steps=30_000,
+        warmup_steps=1_000,
+        peak_lr=5e-5,
+        decay_lr=5e-6,
+        num_workers=8,
+        save_interval=5_000,
+    ),
+    # H20-3E x4: same sample budget as x8, with sqrt-scaled LR.
+    _ur7_h20_config(
+        name="pi05_bund_20260917_n906_v21_new_80G_4gpu_full",
+        fsdp_devices=4,
+        batch_size=128,
+        num_train_steps=60_000,
+        warmup_steps=1_000,
+        peak_lr=3.5e-5,
+        decay_lr=3.5e-6,
+        num_workers=8,
+        save_interval=10_000,
+    ),
+    # H20-3E x2: full fine-tuning run, same 7.68M sampled-chunk budget as x8/x4.
+    _ur7_h20_config(
+        name="pi05_bund_20260917_n906_v21_new_80G_2gpu_full",
+        fsdp_devices=2,
+        batch_size=64,
+        num_train_steps=120_000,
+        warmup_steps=1_000,
+        peak_lr=2.5e-5,
+        decay_lr=2.5e-6,
+        num_workers=8,
+        save_interval=20_000,
+    ),
+    # Local 4-GPU LoRA fine-tuning for the same UR7 dataset.
+    # /16T-2/sudu/code/.data/bund_demo_data_0reset_0827_v002_v21_reconstructed
+    TrainConfig(
+        name="pi05_bund_demo_data_0reset_0827_v002_v21_reconstructed_lora_local4",
+        project_name="openpi_ur7_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotUR7DataConfig(
+            repo_id="/16T-2/sudu/code/.data/bund_demo_data_0reset_0827_v002_v21_reconstructed",
+            relative_action_dims=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+            absolute_action_dims=(9,),
+            assets=AssetsConfig(
+                assets_dir="/16T-2/sudu/code/.data/bund_demo_data_0reset_0827_v002_v21_reconstructed",
+                asset_id="assets",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/hdd4tb/sankuai/code/07_具身/dataset/02_开源模型/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        fsdp_devices=4,
+        batch_size=4,
+        num_train_steps=20_000,
+        num_workers=4,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=1_000,
+        checkpoint_base_dir="/16T-2/sudu/code/.result",
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

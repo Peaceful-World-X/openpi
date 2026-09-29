@@ -1,0 +1,8 @@
+# Minimal dependencies for the UR7 deployment client.
+# Python: 3.10-3.12. The policy model and CUDA runtime stay on the server.
+
+numpy>=1.22.4,<2.0
+PyYAML>=6.0,<7
+scipy>=1.10,<2
+ur-rtde>=1.6,<2
+pyrealsense2>=2.55,<3
