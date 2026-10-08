@@ -4,10 +4,29 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${_OPENPI_LOG_SUBMIT:-0}" != 1 ]]; then
-  exec /usr/bin/python3 "${ROOT_DIR}/scripts/run_logged.py" submit bash "${ROOT_DIR}/submit.sh" "$@"
+  bootstrap_python="${OPENPI_BOOTSTRAP_PYTHON:-}"
+  if [[ -n "${bootstrap_python}" && ! -x "${bootstrap_python}" ]]; then
+    bootstrap_python=""
+  fi
+  if [[ -z "${bootstrap_python}" ]]; then
+    for candidate in python3 python /usr/local/bin/python3 /opt/conda/bin/python /usr/bin/python3; do
+      if [[ "${candidate}" == */* ]]; then
+        [[ -x "${candidate}" ]] || continue
+        bootstrap_python="${candidate}"
+      elif command -v "${candidate}" >/dev/null 2>&1; then
+        bootstrap_python="$(command -v "${candidate}")"
+      fi
+      [[ -n "${bootstrap_python}" ]] && break
+    done
+  fi
+  if [[ -n "${bootstrap_python}" ]]; then
+    OPENPI_BOOTSTRAP_PYTHON="${bootstrap_python}" exec "${bootstrap_python}" "${ROOT_DIR}/scripts/run_logged.py" submit bash "${ROOT_DIR}/submit.sh" "$@"
+  fi
+  echo "No system Python is available for submit logging; continuing without the log wrapper." >&2
+  export _OPENPI_LOG_SUBMIT=1
 fi
 
-BASE_PYTHON="${OPENPI_SUBMIT_PYTHON:-/usr/bin/python3}"
+BASE_PYTHON="${OPENPI_SUBMIT_PYTHON:-${OPENPI_BOOTSTRAP_PYTHON:-/usr/bin/python3}}"
 SUBMIT_ENV="${OPENPI_SUBMIT_ENV:-/openpi-submit-venv}"
 SUBMIT_INDEX="${OPENPI_SUBMIT_INDEX:-https://pypi.antfin-inc.com/simple/}"
 

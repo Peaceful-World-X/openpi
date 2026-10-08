@@ -15,8 +15,20 @@ export DEBIAN_FRONTEND=noninteractive
 export GIT_LFS_SKIP_SMUDGE=1
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
-export PATH="/usr/local/bin:${HOME}/.local/bin:${PATH}"
+export PATH="${ROOT_DIR}:/usr/local/bin:${HOME}/.local/bin:${PATH}"
 unset VIRTUAL_ENV
+
+# The internal package mirror uses a private CA that is not present in some
+# fresh training images. Keep certificate verification for every other host,
+# but allow this explicitly configured internal mirror to bootstrap uv.
+PIP_NETWORK_ARGS=()
+UV_NETWORK_ARGS=()
+if [[ "${UV_DEFAULT_INDEX}" == https://artifacts.antgroup-inc.cn/* || "${UV_DEFAULT_INDEX}" == https://artifacts.antgroup-inc.cn ]]; then
+  PIP_NETWORK_ARGS+=(--trusted-host artifacts.antgroup-inc.cn)
+  UV_NETWORK_ARGS+=(--allow-insecure-host artifacts.antgroup-inc.cn)
+  export PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-artifacts.antgroup-inc.cn}"
+  export UV_INSECURE_HOST="${UV_INSECURE_HOST:-artifacts.antgroup-inc.cn}"
+fi
 
 die() { echo "init_env.sh: $*" >&2; exit 1; }
 
@@ -60,7 +72,8 @@ else
   echo "Skipping apt packages (not root or apt-get is unavailable)"
 fi
 
-have python3 || die "找不到 python3"
+BOOTSTRAP_PYTHON="$(find_bootstrap_python || true)"
+[[ -n "${BOOTSTRAP_PYTHON}" ]] || die "找不到可用于安装环境的系统 Python"
 
 python_version_ok() {
   "$1" - <<'PY'
@@ -113,16 +126,17 @@ PY
 
 echo "[3/5] Installing uv"
 if ! have uv; then
-  PIP_INSTALL_ARGS=(--no-cache-dir --index-url "${UV_DEFAULT_INDEX}" uv)
+  PIP_INSTALL_ARGS=(--no-cache-dir --index-url "${UV_DEFAULT_INDEX}" "${PIP_NETWORK_ARGS[@]}" uv)
   if [[ "${EUID}" -eq 0 ]]; then
     PIP_INSTALL_ARGS=(--break-system-packages "${PIP_INSTALL_ARGS[@]}")
   else
     PIP_INSTALL_ARGS=(--user "${PIP_INSTALL_ARGS[@]}")
   fi
-  python3 -m pip install "${PIP_INSTALL_ARGS[@]}" || die "无法从 ${UV_DEFAULT_INDEX} 安装 uv"
+  "${BOOTSTRAP_PYTHON}" -m pip install "${PIP_INSTALL_ARGS[@]}" || die "无法从 ${UV_DEFAULT_INDEX} 安装 uv"
 fi
 have uv || die "uv 安装失败"
-echo "uv=$("$(command -v uv)" --version)"
+UV_COMMAND="$(command -v uv)"
+echo "uv=${UV_COMMAND} ($("${UV_COMMAND}" --version))"
 
 mkdir -p "${PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}"
 
@@ -131,7 +145,8 @@ cd "${ROOT_DIR}"
 # Refresh wheel URLs/local sources before touching the existing venv.
 # No --upgrade: prefer locked versions; all local source directories must exist.
 uv lock --python "${PYTHON_SPEC}" \
-  --default-index "${UV_DEFAULT_INDEX}" --system-certs
+  --default-index "${UV_DEFAULT_INDEX}" --system-certs \
+  "${UV_NETWORK_ARGS[@]}"
 
 if [[ "${OPENPI_RECREATE_ENV:-0}" == "1" ]] || {
   [[ -x "${VENV_DIR}/bin/python" ]] && ! python_version_ok "${VENV_DIR}/bin/python";
@@ -147,7 +162,13 @@ SYNC_ARGS=(
   --default-index "${UV_DEFAULT_INDEX}"
   --system-certs
   --no-build-package mujoco
+  # LeRobot declares pynput for interactive robot controls. OpenPI training
+  # only reads LeRobot datasets, so skip pynput and its native evdev input
+  # backend; evdev has no wheel in this image and would require clang/root.
+  --no-install-package pynput
+  --no-install-package evdev
 )
+SYNC_ARGS+=("${UV_NETWORK_ARGS[@]}")
 if [[ "${OPENPI_INSTALL_DEV:-0}" != "1" ]]; then
   SYNC_ARGS+=(--no-dev)
 fi
@@ -155,6 +176,60 @@ uv "${SYNC_ARGS[@]}"
 
 PYTHON="${VENV_DIR}/bin/python"
 [[ -x "${PYTHON}" ]] || die "虚拟环境创建失败: ${PYTHON}"
+
+prepare_torchcodec_ffmpeg() {
+  local site_packages source_dir runtime_dir env_file
+  site_packages="$(${PYTHON} -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+  source_dir=""
+  for candidate in "${site_packages}/opencv_python_headless.libs" "${site_packages}/opencv_python.libs"; do
+    if [[ -d "${candidate}" ]]; then
+      source_dir="${candidate}"
+      break
+    fi
+  done
+
+  # System FFmpeg is preferred when present. The OpenCV wheel fallback is
+  # needed in non-root images where apt packages cannot be installed.
+  local system_ffmpeg=0
+  for candidate in /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu; do
+    if compgen -G "${candidate}/libavutil.so.5[6-9]" >/dev/null; then
+      system_ffmpeg=1
+      break
+    fi
+  done
+  if (( system_ffmpeg )); then
+    echo "FFmpeg runtime found in system library paths"
+    return 0
+  fi
+  [[ -n "${source_dir}" ]] || {
+    echo "FFmpeg runtime not found; torchcodec verification may fail" >&2
+    return 0
+  }
+
+  runtime_dir="${OPENPI_FFMPEG_RUNTIME_DIR:-${VENV_DIR}/lib/openpi-ffmpeg}"
+  mkdir -p "${runtime_dir}" || die "无法创建 FFmpeg 运行库目录: ${runtime_dir}"
+  "${BOOTSTRAP_PYTHON}" - "${source_dir}" "${runtime_dir}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+source, target = map(Path, sys.argv[1:])
+supported = {"avutil", "avcodec", "avformat", "avfilter", "swscale", "swresample", "postproc", "avdevice"}
+for library in source.iterdir():
+    match = re.match(r"lib([a-z0-9]+)-[^/]+\.so\.([0-9]+)", library.name)
+    if not match or match.group(1) not in supported:
+        continue
+    link = target / f"lib{match.group(1)}.so.{match.group(2)}"
+    link.unlink(missing_ok=True)
+    link.symlink_to(library.resolve())
+PY
+  export LD_LIBRARY_PATH="${runtime_dir}:${source_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  env_file="${VENV_DIR}/openpi-runtime.env"
+  printf 'export LD_LIBRARY_PATH=%q\n' "${LD_LIBRARY_PATH}" >"${env_file}"
+  echo "FFmpeg runtime prepared from ${source_dir}"
+}
+
+prepare_torchcodec_ffmpeg
 
 echo "[5/5] Verifying the installed environment"
 "${PYTHON}" - "${OPENPI_TOKENIZER_PATH:?}" <<'PY'
@@ -199,10 +274,14 @@ for name in required:
     module = __import__(name)
     print(f"{name}={getattr(module, '__version__', 'ok')}")
 
-# LeRobot imports its video backend lazily on the first dataset read. Import
-# the decoder explicitly to detect missing FFmpeg/VA libraries before training.
-from torchcodec.decoders import VideoDecoder
-print("torchcodec VideoDecoder import ok")
+# OpenPI's pinned LeRobot 0.1.0 dataset reader uses PyAV for video decoding.
+# TorchCodec is an optional LeRobot dependency and requires libavdevice, which
+# is absent from some non-root images; importing it here would reject an
+# otherwise usable training environment.
+import av
+from lerobot.common.datasets import video_utils
+print(f"av={av.__version__}")
+print(f"lerobot video backend={video_utils.__name__}")
 
 import jax
 

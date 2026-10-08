@@ -246,6 +246,17 @@ def _parse_episode_indices(value: str) -> list[int]:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--config-name",
+        default=DEFAULT_CONFIG,
+        help="Training configuration matching the checkpoint architecture (full or LoRA).",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=pathlib.Path,
+        default=DEFAULT_DATA_PATH,
+        help="Extracted LeRobot dataset root containing meta/, data/, videos/ and assets/.",
+    )
+    parser.add_argument(
         "--checkpoint-dir",
         required=True,
         help="Exact completed checkpoint step directory containing params/ and assets/.",
@@ -361,6 +372,7 @@ def _save_report(
 def _evaluate_episode(
     *,
     policy: Any,
+    config_name: str,
     data_path: pathlib.Path,
     validation: dict[str, Any],
     episode_index: int,
@@ -421,7 +433,7 @@ def _evaluate_episode(
     pred = np.concatenate(pred_chunks)
     gt = np.concatenate(gt_chunks)
     metadata = {
-        "config": DEFAULT_CONFIG,
+        "config": config_name,
         "checkpoint": str(checkpoint),
         "data_path": str(data_path),
         "episode_index": episode_index,
@@ -449,7 +461,7 @@ def _evaluate_episode(
 
 def main() -> None:
     args = _parse_args()
-    data_path = DEFAULT_DATA_PATH.expanduser().resolve()
+    data_path = args.data_path.expanduser().resolve()
     if args.compare_horizon <= 0 or args.compare_horizon > 50:
         raise ValueError("compare-horizon must be between 1 and 50")
     checkpoint = _require_checkpoint_dir(pathlib.Path(args.checkpoint_dir))
@@ -460,7 +472,9 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "config": args.config_name,
                 "checkpoint": str(checkpoint),
+                "data_path": str(data_path),
                 "episode_indices": args.episode_index,
                 "episodes": [validations[index] for index in args.episode_index],
             },
@@ -471,13 +485,14 @@ def main() -> None:
     import openpi.policies.policy_config as policy_config
     from openpi.training import config as training_config
 
-    train_config = training_config.get_config(DEFAULT_CONFIG)
+    train_config = training_config.get_config(args.config_name)
     # Load the model once, then evaluate each requested dataset episode.
     policy = policy_config.create_trained_policy(train_config, checkpoint)
-    output_root = args.output_dir or REPORT_ROOT / DEFAULT_CONFIG
+    output_root = args.output_dir or REPORT_ROOT / args.config_name
     for episode_index in args.episode_index:
         _evaluate_episode(
             policy=policy,
+            config_name=args.config_name,
             data_path=data_path,
             validation=validations[episode_index],
             episode_index=episode_index,

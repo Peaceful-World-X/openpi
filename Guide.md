@@ -1,33 +1,13 @@
 # UR7 Pi05 训练执行指南
-
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="/root/.local/bin:$PATH"
 uv --version
 
+
 ```
 
-# 云端训练
-
-先在 `.env` 配好数据、模型、GPU 卡型/数量、训练配置和 OSS 信息，以下两个入口二选一。
-
-```bash
-# 入口 1：当前容器没有 GPU，提交 GPU 训练任务
-cd /ossfs/workspace/openpi
-bash ./submit.sh
-
-# 入口 2：当前云端容器已有 GPU，直接在当前容器训练
-cd /ossfs/workspace/openpi
-bash ./k8s_job.sh
-```
-
-```txt
-无 GPU：.env → submit.sh → main.py → 申请 GPU → 新容器运行 k8s_job.sh → 解压数据 → 安装环境 → 配置 OSS → 训练并上传
-
-有 GPU：.env →                               当前容器运行 k8s_job.sh  → 解压数据 → 安装环境 → 配置 OSS → 训练并上传
-```
-
-# 本地训练
+# 训练
 
 ```bash
 ## 阶段 0：进入项目并检查 GPU
@@ -60,17 +40,51 @@ cd /16T-2/sudu/code/openpi
 export CUDA_VISIBLE_DEVICES=0,1
 ./run_train.sh
 
-## 开环验证
+```
+
+# 开环验证
+```bash
+
 cd /16T-2/sudu/code/openpi
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.40
+
 CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=src .venv/bin/python \
 scripts/eval_ur7_openloop.py \
-  --checkpoint-dir /16T-2/sudu/code/result/pi05_bund_demo_data_0reset_0827_v002_v21_reconstructed_lora_local4/ur7_pi05_lora_local4/79999 \
+  --config-name pi05_bund_20260917_n906_v21_new_80G_8gpu_full \
+  --checkpoint-dir /16T-2/sudu/code/result/pi05_h20_8cards_20260929_145009/20000 \
+  --data-path /16T-2/sudu/code/.data/bund_20260917_n906_v21_new \
   --episode-index 0,50,100,200 \
   --compare-horizon 50 \
-  --output-dir  /16T-2/sudu/code/.result/openloop/pi05_bund_demo_data_0reset_0827_v002_v21_reconstructed_lora_local4
+  --output-dir /16T-2/sudu/code/.result/openloop/pi05_h20_8cards_20260929_145009
 
+```
+
+# 云端训练
+
+先在 `.env` 配好数据、模型、GPU 卡型/数量、训练配置和 OSS 信息，以下两个入口二选一。
+
+首次提交前，把数据资产和两个本地依赖项目上传到 OSS。训练容器会在运行目录中恢复 `lerobot/`、`dlimp/`，因此不会从 GitHub 在线安装这两个项目。
+
+```txt
+无 GPU：.env → submit.sh → main.py → 申请 GPU → 新容器运行 k8s_job.sh → 解压数据 → 安装环境 → 配置 OSS → 训练并上传
+
+有 GPU：.env →                               当前容器运行 k8s_job.sh  → 解压数据 → 安装环境 → 配置 OSS → 训练并上传
+```
+
+```bash
+# 入口 1：当前容器没有 GPU，提交 GPU 训练任务
+cd /ossfs/code/openpi
+bash ./submit.sh
+
+# 入口 2：当前云端容器已有 GPU，直接在当前容器训练
+cd /ossfs/code/openpi
+bash ./k8s_job.sh
+
+# 上传文件
+bash scripts/upload_dataset_to_oss.sh --all
+# 如果 .data 已上传，只同步两个项目源码
+bash scripts/upload_dataset_to_oss.sh --code-deps
 ```
 
 # replay
@@ -85,6 +99,7 @@ cd /data/sudo/openpi
   --confirm ENABLE_UR7_MOTION
   
 ```
+
 
 # 推理
 ```bash
@@ -131,5 +146,6 @@ env -u HTTP_PROXY \
 7. 按 q：退出程序。
 
 命令行会逐次显示收到的 Enter、Space、`h`、`q` 按键、按键处理结果以及状态变化；不符合当前状态的按键会显示为“已忽略”。
+
 
 ```

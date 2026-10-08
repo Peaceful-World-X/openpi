@@ -4,7 +4,26 @@ set -euo pipefail
 # Capture initialization as well as training, before loading .env or installing Python.
 if [[ "${_OPENPI_LOG_TRAIN:-0}" != 1 ]]; then
   job_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  exec /usr/bin/python3 "${job_root}/scripts/run_logged.py" train bash "${job_root}/k8s_job.sh" "$@"
+  bootstrap_python="${OPENPI_BOOTSTRAP_PYTHON:-}"
+  if [[ -n "${bootstrap_python}" && ! -x "${bootstrap_python}" ]]; then
+    bootstrap_python=""
+  fi
+  if [[ -z "${bootstrap_python}" ]]; then
+    for candidate in python3 python /usr/local/bin/python3 /opt/conda/bin/python /usr/bin/python3; do
+      if [[ "${candidate}" == */* ]]; then
+        [[ -x "${candidate}" ]] || continue
+        bootstrap_python="${candidate}"
+      elif command -v "${candidate}" >/dev/null 2>&1; then
+        bootstrap_python="$(command -v "${candidate}")"
+      fi
+      [[ -n "${bootstrap_python}" ]] && break
+    done
+  fi
+  if [[ -n "${bootstrap_python}" ]]; then
+    OPENPI_BOOTSTRAP_PYTHON="${bootstrap_python}" exec "${bootstrap_python}" "${job_root}/scripts/run_logged.py" train bash "${job_root}/k8s_job.sh" "$@"
+  fi
+  echo "No system Python is available for startup logging; continuing without the log wrapper." >&2
+  export _OPENPI_LOG_TRAIN=1
 fi
 
 # Container/data/OSS setup is shared with manual runs.
@@ -27,6 +46,14 @@ init_cfg_main
 if [[ "${OPENPI_ENV_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
+# init_env.sh runs as a child shell. Restore its user-space FFmpeg library
+# path for the training process (system FFmpeg remains the default when it is
+# available).
+runtime_env="${PYTHON%/bin/python}/openpi-runtime.env"
+if [[ -f "${runtime_env}" ]]; then
+  # shellcheck disable=SC1090
+  source "${runtime_env}"
+fi
 cd "${ROOT_DIR}"
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export JAX_PLATFORMS=cuda
@@ -46,6 +73,12 @@ OSS_RUN_URI="${OSS_ROOT%/}/${PROJECT_NAME}/${EXP_NAME}"
 UPLOADED_DIR="${OPENPI_UPLOAD_MARKERS_DIR:-/tmp/openpi-uploaded-checkpoints}/${CONFIG_NAME}/${EXP_NAME}"
 mkdir -p "${CHECKPOINT_DIR}/${CONFIG_NAME}" "${UPLOADED_DIR}"
 
+sync_training_log() {
+  [[ -f "${TRAIN_LOG}" ]] || return 0
+  echo "Uploading training log to ${OSS_RUN_URI}/train.log"
+  ossutil_upload cp "${TRAIN_LOG}" "${OSS_RUN_URI}/train.log" --update
+}
+
 sync_completed_checkpoints() {
   local checkpoint_path step marker
   [[ -d "${RUN_DIR}" ]] || return 0
@@ -61,6 +94,9 @@ sync_completed_checkpoints() {
     echo "Uploading completed checkpoint ${step} to ${OSS_RUN_URI}/${step}/"
     ossutil_upload cp -r "${checkpoint_path}/" "${OSS_RUN_URI}/${step}/" -j 4 --update || return $?
     printf '%s\n' "${OSS_RUN_URI}/${step}/" >"${marker}" || return $?
+    # Keep the loss/metric log beside the uploaded checkpoints so it can be
+    # plotted while training is still running.
+    sync_training_log || return $?
   done
 }
 
@@ -73,6 +109,9 @@ upload_loop() {
   while true; do
     if ! sync_completed_checkpoints; then
       echo "Checkpoint upload failed; retrying in ${UPLOAD_INTERVAL_SECONDS}s" >&2
+    fi
+    if ! sync_training_log; then
+      echo "Training log upload failed; retrying in ${UPLOAD_INTERVAL_SECONDS}s" >&2
     fi
     sleep "${UPLOAD_INTERVAL_SECONDS}" &
     sleep_pid=$!
@@ -92,9 +131,7 @@ stop_uploader() {
 sync_results() {
   local status=0
   sync_completed_checkpoints || status=$?
-  if [[ -f "${TRAIN_LOG}" ]]; then
-    ossutil_upload cp "${TRAIN_LOG}" "${OSS_RUN_URI}/train.log" --update || status=$?
-  fi
+  sync_training_log || status=$?
   return "${status}"
 }
 

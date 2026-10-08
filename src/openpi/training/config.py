@@ -659,7 +659,7 @@ def _ur7_h20_config(
                 asset_id="assets",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(settings.get("OPENPI_PARAMS_DIR") or "/ossfs/workspace/.models/openpi_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(settings.get("OPENPI_PARAMS_DIR") or "/ossfs/workspace/.data/openpi_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=warmup_steps,
             peak_lr=peak_lr,
@@ -1097,7 +1097,7 @@ _CONFIGS = [
         name="pi05_bund_20260917_n906_v21_new_80G_8gpu_full",
         fsdp_devices=8,
         batch_size=256,
-        num_train_steps=30_000,
+        num_train_steps=50_000,
         warmup_steps=1_000,
         peak_lr=5e-5,
         decay_lr=5e-6,

@@ -8,6 +8,7 @@ import datetime as dt
 import os
 from pathlib import Path
 import shlex
+import shutil
 import sys
 
 # Log SDK imports and submission errors too; no training environment is needed.
@@ -30,9 +31,14 @@ from pypai.conf import KMConf
 from pypai.conf import NasStoreConf
 from pypai.job import PythonJobBuilder
 
-ROOT_DIR = Path("/ossfs/workspace/openpi")
+# Resolve the project from this file.  The local submitter lives under
+# /16T-2/... while the worker source is mounted under /ossfs/workspace.
+# Keeping this configurable also makes the submission testable from a clone.
+ROOT_DIR = Path(os.environ.get("OPENPI_ROOT_DIR", Path(__file__).resolve().parent)).resolve()
 SUBMIT_ROOT = Path("/tmp/openpi_submit")
 IMAGE = "reg.docker.alibaba-inc.com/aii/aistudio:12550155-20250530161247"
+NAS_MOUNT_PATH = "/input"
+NAS_WORKSPACE_PATH = f"{NAS_MOUNT_PATH}/workspace"
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,11 @@ def _require_environment_value(name: str, *aliases: str) -> None:
     if not any(os.environ.get(key) for key in (name, *aliases)):
         accepted_names = ", ".join((name, *aliases))
         raise RuntimeError(f"Missing required environment variable (accepted names: {accepted_names})")
+
+
+def _worker_nas_path(value: str) -> str:
+    """Map the interactive container's NAS path to the submitted task mount."""
+    return value.replace("/ossfs/workspace/", f"{NAS_WORKSPACE_PATH}/")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -147,8 +158,63 @@ def submit_job(args: argparse.Namespace) -> None:
     )
     km_conf = KMConf(image=IMAGE)
 
-    # The submit package is intentionally tiny so pypai does not scan openpi/.venv.
+    # Follow the AIStudio tutorial: source_root is the job working directory
+    # and command must be relative to it.  /ossfs/workspace is a separate NAS
+    # mount, so an absolute command there can hide the submitted source tree.
+    # Keep large local environments, datasets and checkpoints out of the
+    # submission package; those are supplied by NAS or prepared by init_cfg.
     SUBMIT_ROOT.mkdir(parents=True, exist_ok=True)
+    for entry in SUBMIT_ROOT.iterdir():
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    files = (".env", "README.md", "k8s_job.sh", "init_cfg.sh", "init_env.sh", "pyproject.toml", "uv.lock")
+    # LeRobot and dlimp are downloaded from OSS during worker initialization;
+    # keep them out of the SDK source package because they are large.
+    directories = ("src", "scripts", "packages")
+    for name in files:
+        source = ROOT_DIR / name
+        if source.is_file():
+            destination = SUBMIT_ROOT / name
+            if name == ".env":
+                # The source container exposes NAS at /ossfs, while the SDK
+                # task uses /input to keep NAS separate from source_root.
+                text = source.read_text(encoding="utf-8")
+                destination.write_text(_worker_nas_path(text), encoding="utf-8")
+                shutil.copystat(source, destination)
+            else:
+                shutil.copy2(source, destination)
+    for name in directories:
+        source = ROOT_DIR / name
+        if source.is_dir():
+            shutil.copytree(
+                source,
+                SUBMIT_ROOT / name,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".git", "__pycache__", ".cache", "*.pyc"),
+            )
+    # The worker may need ossutil before its NAS is available. Include only
+    # this small bootstrap binary; never include the dataset archive itself.
+    ossutil_source = os.environ.get("OPENPI_OSSUTIL_SOURCE", "")
+    if ossutil_source and Path(ossutil_source).is_file():
+        destination = SUBMIT_ROOT / "ossutil64"
+        shutil.copy2(ossutil_source, destination)
+        destination.chmod(0o755)
+    # uv is needed before the worker environment exists. Carry the local
+    # standalone binary when available so a fresh worker does not depend on
+    # the internal PyPI mirror's TLS certificate during bootstrap. init_env.sh
+    # prepends the submitted source root to PATH and keeps pip as a fallback.
+    uv_source = os.environ.get("OPENPI_UV_SOURCE") or shutil.which("uv")
+    if uv_source and Path(uv_source).is_file():
+        destination = SUBMIT_ROOT / "uv"
+        if Path(uv_source).resolve() != destination.resolve():
+            shutil.copy2(uv_source, destination)
+        destination.chmod(0o755)
+    missing = [name for name in files if not (SUBMIT_ROOT / name).is_file()]
+    missing += [name for name in directories if not (SUBMIT_ROOT / name).is_dir()]
+    if missing:
+        raise RuntimeError(f"Submission package is incomplete; missing: {', '.join(missing)}")
     (SUBMIT_ROOT / "README.txt").write_text("OpenPI K8S submit files\n", encoding="utf-8")
 
     envs = {
@@ -173,17 +239,19 @@ def submit_job(args: argparse.Namespace) -> None:
             "PYTHONUNBUFFERED",
             "WANDB_MODE",
         }:
-            envs.setdefault(key, value)
+            envs.setdefault(key, _worker_nas_path(value) if key.startswith("OPENPI_") else value)
 
     job = PythonJobBuilder(
         source_root=str(SUBMIT_ROOT),
-        command=f"bash {ROOT_DIR}/k8s_job.sh",
+        command="bash k8s_job.sh",
         main_file="",
         km_conf=km_conf,
         master=master,
         k8s_app_name=args.resource_group,
         k8s_priority="high",
-        nas_storage=NasStoreConf(mount_path="/ossfs/workspace"),
+        # Keep NAS separate from the SDK source workspace. The tutorial uses
+        # /input for this reason; the NAS root contains its workspace/ folder.
+        nas_storage=NasStoreConf(mount_path=NAS_MOUNT_PATH),
         tag=f"type=train,model=pi05,gpu={gpu_name}",
         platform="kubemaker",
         envs=envs,

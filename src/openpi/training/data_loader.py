@@ -143,6 +143,11 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        # The worker image may contain torchcodec without its FFmpeg shared
+        # libraries. OpenPI's LeRobot 0.1.0 backend supports PyAV directly,
+        # so select it explicitly instead of letting LeRobot auto-select
+        # torchcodec merely because the optional package is installed.
+        video_backend="pyav",
     )
 
     if data_config.prompt_from_task:

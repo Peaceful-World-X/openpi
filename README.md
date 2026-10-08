@@ -164,6 +164,70 @@ The command will log training progress to the console and save checkpoints to th
 
 **Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
 
+### AIStudio K8S cloud training (UR7)
+
+在 AIStudio CPU 提交容器中，可先自动安装并检查提交 SDK（不申请 GPU）：
+
+```bash
+cd /ossfs/workspace/openpi
+bash ./submit.sh --check-only
+```
+
+在 `/ossfs/workspace/openpi/.env` 中统一设置数据包、base 权重、输出路径、GPU 卡型/数量、训练配置、资源组和 OSS 信息。日常换数据或卡数只修改 `.env`，三个启动脚本无需修改。
+
+提交前准备好 `.env` 指定的输入（默认路径）：
+
+```text
+/ossfs/workspace/.data/bund_20260917_n906_v21_new.tar.gz
+/ossfs/workspace/.data/cpython-3.11.16+20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+/ossfs/workspace/.data/ossutil64
+/ossfs/workspace/.models/paligemma_tokenizer.model
+/ossfs/workspace/.models/openpi_base/params
+/ossfs/workspace/openpi/lerobot
+/ossfs/workspace/openpi/dlimp
+```
+
+数据包须包含 `meta/info.json`、`data/`、`assets/norm_stats.json` 及所需视频；支持外层一个数据集目录或平铺结构。base 的 `params` 和本地源码依赖须完整。
+
+```bash
+cd /ossfs/workspace/openpi
+# 当前已经有 GPU 的容器：自动初始化、训练、上传 OSS
+bash ./k8s_job.sh
+```
+
+需要申请新 GPU 作业时执行（缺少 pypai 会自动安装）：
+
+```bash
+cd /ossfs/workspace/openpi
+bash ./submit.sh
+```
+
+`submit.sh` 优先使用系统 Python 的可用 SDK；否则在 `/openpi-submit-venv` 中按教程安装
+`aii-pypai`、`couler-core`、`ant-couler`，验证后调用 `main.py`。提交 SDK 内部软件源
+`https://pypi.antfin-inc.com/simple/` 须可达；不会安装到 `/openpi-venv` 训练环境。
+
+提交默认读取 `.env` 的 `OPENPI_GPU_TYPE`、`OPENPI_GPU_NUM`、`OPENPI_TRAIN_CONFIG`、`OPENPI_RESOURCE_GROUP`。当前为 H20 ×2；实际申请 A100 时将卡型改为 `a100`。卡数必须与所选配置匹配。提交返回的 trace URL 可查看任务状态和日志。
+
+三个脚本的分工：
+
+- `init_env.sh`：解压 Python 到 `/python`，在 `/openpi-venv` 安装和校验依赖、预置 tokenizer；缓存为 `/uv-cache`。apt 和 Python 内部软件源仍需可达。
+- `init_cfg.sh`：解压数据到 `OPENPI_DATA_DIR`，调用环境安装，将 NAS 上的 ossutil v1.7.18 自动复制到 `/ossutil64`，配置 OSS。单独执行只准备容器。
+- `k8s_job.sh`：调用初始化、按选定配置训练，每 300 秒上传已完成 checkpoint，退出时同步 checkpoint 和日志。默认自动生成实验名，不覆盖旧结果；续训追加日志。收到 `SIGTERM` 或 `Ctrl+C` 时停止训练工作进程并同步已完成的 checkpoint，保留中断退出码（强制 `SIGKILL` 无法执行收尾）。
+
+`OPENPI_DATA_DIR` 是数据集最终目录：设为 `/data` 时，解压后直接得到 `/data/meta`、`/data/data` 和 `/data/assets`，不追加压缩包名称。新容器换数据只需修改 `OPENPI_DATA_ARCHIVE`；已有容器会复用通过检查的数据目录，换数据时需同时指定新的 `OPENPI_DATA_DIR`。`config.py` 同样读取 `.env`，直接执行 `scripts/train.py` 也会使用相同数据、norm、base 和输出路径。优先级：命令行参数 > 已导出的环境变量 > `.env` > 代码默认值；`.env` 使用普通 `KEY=VALUE`，路径写完整值。
+
+训练超参数保留在 `src/openpi/training/config.py`，由 `OPENPI_TRAIN_CONFIG` 选择：
+
+| 配置名后缀（共同前缀 `pi05_bund_20260917_n906_v21_new_`） | 卡数/FSDP | Global batch | 步数 | Warmup | Peak LR → End LR | Workers | 保存/保留间隔 |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| `80G_8gpu_full` | 8 | 256 | 30,000 | 1,000 | 5e-5 → 5e-6 | 8 | 5,000 |
+| `80G_4gpu_full` | 4 | 128 | 60,000 | 1,000 | 3.5e-5 → 3.5e-6 | 8 | 10,000 |
+| `80G_2gpu_full` | 2 | 64 | 120,000 | 1,000 | 2.5e-5 → 2.5e-6 | 8 | 20,000 |
+
+三套均为 pi05 base 全参数微调，使用 BF16、AdamW、EMA=0.99、cosine 学习率和 50 步 chunk。动作 0:9 为相对 chunk 起点 EEF 的位姿，9 为绝对夹爪，norm 默认读取数据目录的 `assets/norm_stats.json`。三套各采样 768 万个 chunk，样本量相同不保证训练效果相同。`keep_period=save_interval` 保留每次定期保存；最终目录分别为 `29999`、`59999`、`119999`。
+
+结果默认写入 `/result/<config>/<exp>/`，上传至 `OPENPI_OSS_ROOT/<config>/<exp>/`。需要续训时同时设置 `OPENPI_EXP_NAME=<已有实验名>` 和 `OPENPI_RESUME=1`，并保留该实验的本地 checkpoint；不会自动从 OSS 下载 checkpoint。
+
 ### 3. Spinning up a policy server and running inference
 
 Once training is complete, we can run inference by spinning up a policy server and then querying it from a LIBERO evaluation script. Launching a model server is easy (we use the checkpoint for iteration 20,000 for this example, modify as needed):
