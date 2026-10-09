@@ -137,11 +137,11 @@ env -u HTTP_PROXY \
     --confirm ENABLE_UR7_MOTION 
 
 启动后在当前终端操作：
-1. 第一次按 Enter：机械臂移动到复位位姿。
+1. 第一次按 Enter：按 reset.joints_rad 的绝对关节角执行 moveJ 复位（q6 回到 0.134157449 rad）。
 2. 复位完成后，按 Space：开始推理和执行动作。
 3. 运行中按 Space：立即停止机械臂。
 4. 停止状态按 Enter：打开夹爪。
-5. 停止状态按 h：移动到 home 位姿。
+5. 停止状态按 h：按 home 的绝对关节角归位，默认继承 reset。
 6. 停止状态再次按 Space：继续推理。
 7. 按 q：退出程序。
 

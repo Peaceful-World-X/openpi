@@ -6,7 +6,7 @@ server:
 
 debug:
   enabled: false
-  log_path: .data/ur7_client.jsonl
+  log_path: test/traces/ur7_client.jsonl  # 按启动时间/复位次数分别保存观测、原始动作和逐步执行日志
 
 task: "pick the randomly placed housing, lift it, reorient it upright, then stand it stably on the table"
 
@@ -34,8 +34,12 @@ replay:
   initial_move_duration_s: 1.5
 
 robot:
+  # 当前训练数据的 eef 使用法兰坐标（零 TCP 偏移）；不能继承示教器上的夹爪工具长度。
+  # 单位为 xyz 米 + 旋转向量弧度；仅 --execute 时设置，dry-run 只校验。
+  tcp_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   ip: 192.168.1.188
   gripper_connection: 192.168.1.188:63352
+  gripper_speed: 1.0  # 开合速度，范围 0～1；1.0 对应 Robotiq SPE=255（最大）
   state:
     include_force_torque: true
     include_velocity: true
@@ -61,15 +65,17 @@ cameras:
     fps: 30
 
 reset:
-  eef_pose: [0.20, -0.40, 0.35, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-  duration_s: 1
-  position_tolerance_m: 0.1      # 到达后允许的末端位置误差
-  rotation_tolerance_rad: 0.5    # 到达后允许的末端姿态角误差
+  # 2026-10-09T22:54:46.724361+08:00 只读实测的六轴绝对角，单位 rad；直接 moveJ，不解 IK、不选择 ±2π 等价圈数。
+  joints_rad: [1.7334474325180054, -1.6671692333617152, 2.021027390156881, -1.923650404016012, -1.569026295338766, 0.16105914115905762]
+  joint_speed_rad_s: 0.3
+  joint_acceleration_rad_s2: 0.4
+  max_joint_delta_rad: [2.0, 2.0, 2.0, 3.0, 3.0, 6.0]  # 固定绝对目标，q6 最多允许 6 rad 的真实回程。
+  joint_position_tolerance_rad: 0.02
+  stationary_velocity_tolerance_rad_s: 0.02
   gripper_open_wait_s: 0.5
-  gripper_open_min: 0          # 等待后要求夹爪打开比例至少
+  gripper_open_min: 0
 
-home:
-  eef_pose: [0.20, -0.40, 0.35, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+home: {}  # h 归位继承上面同一组实测绝对关节角。
 
 safety:
   max_translation_step_m: 0.1

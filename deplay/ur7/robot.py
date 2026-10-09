@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -10,8 +11,12 @@ import numpy as np
 
 from .robotiq_tcp import RobotiqTCP
 from .se3 import matrix_to_rot6d, rot6d_to_matrix
+from .joint_reset import JointResetConfig
+from .cartesian_reset import CartesianResetConfig
+from .tcp_config import configure_tcp, validate_tcp_offset
 
 EXECUTE_CONFIRMATION = "ENABLE_UR7_MOTION"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,8 @@ class UR7Robot:
         execute: bool = False,
         confirmation: str | None = None,
         gripper_connection: str | None = None,
+        gripper_speed: float = 0.3,
+        tcp_offset: tuple[float, ...] | list[float] | None = None,
         servo: ServoConfig | None = None,
         teleoperation_servo: ServoConfig | None = None,
         state: StateConfig | None = None,
@@ -74,6 +81,10 @@ class UR7Robot:
             raise PermissionError(
                 f"robot motion requires confirmation text: {EXECUTE_CONFIRMATION}"
             )
+        if not np.isfinite(gripper_speed) or not 0.0 <= gripper_speed <= 1.0:
+            raise ValueError("robot.gripper_speed must be finite and in [0, 1]")
+        self._gripper_speed = float(gripper_speed)
+        expected_tcp = None if tcp_offset is None else validate_tcp_offset(tcp_offset)
         try:
             import rtde_receive
             from scipy.spatial.transform import Rotation
@@ -88,13 +99,25 @@ class UR7Robot:
         self._servo = servo or ServoConfig()
         self._teleoperation_servo = teleoperation_servo or self._servo
         self._state_config = state or StateConfig()
-        if execute:
-            import rtde_control
+        self._gripper = None
+        try:
+            if execute:
+                import rtde_control
 
-            self._control = rtde_control.RTDEControlInterface(robot_ip)
-        self._gripper = (
-            RobotiqTCP(gripper_connection, writable=execute) if gripper_connection else None
-        )
+                self._control = rtde_control.RTDEControlInterface(robot_ip)
+            if expected_tcp is not None:
+                configure_tcp(self._control, self._receive, robot_ip, expected_tcp)
+            self._gripper = (
+                RobotiqTCP(gripper_connection, writable=execute) if gripper_connection else None
+            )
+        except BaseException:
+            # A failed TCP check must not leave a connection/register owner behind.
+            try:
+                if self._control is not None:
+                    self._control.disconnect()
+            finally:
+                self._receive.disconnect()
+            raise
 
     @property
     def execute_enabled(self) -> bool:
@@ -211,51 +234,135 @@ class UR7Robot:
 
     def move_to_joint_target(
         self,
-        joints: np.ndarray,
-        *,
-        speed: float,
-        acceleration: float,
-        max_delta_rad: float,
-        position_tolerance_rad: float = 0.02,
+        config: JointResetConfig,
     ) -> np.ndarray:
-        """Move to one exact, reviewed joint branch before trajectory replay."""
+        """Return to exact absolute joint angles, including the wrist turn count."""
         if self._control is None:
             raise PermissionError("robot adapter is read-only")
-        if self._receive.isEmergencyStopped():
-            raise RuntimeError("UR emergency stop is active; refusing initial replay move")
-        if self._receive.isProtectiveStopped():
-            raise RuntimeError("UR protective stop is active; refusing initial replay move")
-        target = np.asarray(joints, dtype=np.float64)
-        current = np.asarray(self._receive.getActualQ(), dtype=np.float64)
-        if target.shape != (6,) or not np.all(np.isfinite(target)):
-            raise ValueError("initial replay target must be a finite 6D vector")
-        if current.shape != (6,) or not np.all(np.isfinite(current)):
-            raise RuntimeError("current UR joint position is invalid")
-        if not np.isfinite(speed) or not np.isfinite(acceleration) or speed <= 0 or acceleration <= 0:
-            raise ValueError("initial replay speed and acceleration must be positive")
-        if not np.isfinite(max_delta_rad) or max_delta_rad <= 0:
-            raise ValueError("max_delta_rad must be positive")
-        if not np.isfinite(position_tolerance_rad) or position_tolerance_rad <= 0:
-            raise ValueError("position_tolerance_rad must be positive")
-        delta = np.abs(target - current)
-        if float(np.max(delta)) > max_delta_rad:
-            axis = int(np.argmax(delta))
-            raise RuntimeError(
-                f"initial replay move q{axis + 1} delta={delta[axis]:.4f}rad "
-                f"exceeds limit={max_delta_rad:.4f}rad"
+
+        def stationary_joints() -> np.ndarray:
+            if self._receive.isEmergencyStopped():
+                raise RuntimeError("UR emergency stop is active during joint reset")
+            if self._receive.isProtectiveStopped():
+                raise RuntimeError("UR protective stop is active during joint reset")
+            joints = self.get_joint_positions()
+            velocity = np.asarray(self._receive.getActualQd(), dtype=np.float64)
+            if velocity.shape != (6,) or not np.isfinite(velocity).all():
+                raise RuntimeError("invalid joint velocity during reset")
+            if np.max(np.abs(velocity)) > config.stationary_velocity_tolerance_rad_s:
+                raise RuntimeError("UR is not stationary during joint reset")
+            return joints
+
+        target = config.target_from(stationary_joints())
+        if not self._control.isJointsWithinSafetyLimits(target.tolist()):
+            raise RuntimeError("joint reset target violates the controller safety limits")
+        try:
+            accepted = self._control.moveJ(
+                target.tolist(), float(config.speed_rad_s), float(config.acceleration_rad_s2)
             )
-        accepted = self._control.moveJ(target.tolist(), float(speed), float(acceleration))
-        if not accepted:
-            raise RuntimeError("UR initial replay moveJ command was rejected")
-        after = np.asarray(self._receive.getActualQ(), dtype=np.float64)
-        if after.shape != (6,) or not np.all(np.isfinite(after)):
-            raise RuntimeError("UR joint position is invalid after initial replay move")
+            after = stationary_joints()
+            if not accepted:
+                raise RuntimeError("UR joint reset moveJ command was rejected")
+        except BaseException:
+            # moveJ needs stopJ (servoStop only stops servo mode). Preserve
+            # the original fault if the controller no longer accepts writes.
+            try:
+                self._control.stopJ(float(config.acceleration_rad_s2))
+            except Exception:
+                pass
+            raise
         error = float(np.max(np.abs(after - target)))
-        if error > position_tolerance_rad:
+        if error > config.position_tolerance_rad:
             raise RuntimeError(
-                f"initial replay target error={error:.4f}rad exceeds "
-                f"tolerance={position_tolerance_rad:.4f}rad"
+                f"joint reset target error={error:.4f}rad exceeds "
+                f"tolerance={config.position_tolerance_rad:.4f}rad"
             )
+        return after
+
+    def _reset_forward_kinematics(self, joints: np.ndarray) -> np.ndarray:
+        """Query FK without the empty/zero TCP recipe bugs in ur_rtde 1.6.5.
+
+        That SDK sends only six joint registers for an omitted TCP, leaving
+        the old IK reference in the six TCP registers. Passing all-zero TCP
+        uses that same six-value recipe with twelve values and can hang.
+        Query a virtual 1 mm TCP for the zero-TCP case, then transform the
+        computed pose back. This never changes the controller's active TCP.
+        """
+        tcp = validate_tcp_offset(self._control.getTCPOffset())
+        query_tcp = tcp.copy()
+        zero_tcp = not np.any(tcp)
+        if zero_tcp:
+            query_tcp[2] = 0.001
+        forward = np.asarray(
+            self._control.getForwardKinematics(joints.tolist(), query_tcp.tolist()),
+            dtype=np.float64,
+        )
+        if forward.shape != (6,) or not np.isfinite(forward).all():
+            raise RuntimeError("invalid forward kinematics for reset target")
+        if zero_tcp:
+            forward = forward.copy()
+            forward[:3] -= self._rotation.from_rotvec(forward[3:]).apply(query_tcp[:3])
+        return forward
+
+    def move_to_pose_on_joint_branch(
+        self,
+        pose: np.ndarray,
+        config: CartesianResetConfig,
+        *,
+        position_tolerance_m: float,
+        rotation_tolerance_rad: float,
+    ) -> np.ndarray:
+        """Solve the TCP target on the reference branch with the nearest safe q6 turn."""
+        if self._control is None:
+            raise PermissionError("robot adapter is read-only")
+        value = np.asarray(pose, dtype=np.float64)
+        if value.shape != (9,) or not np.isfinite(value).all():
+            raise ValueError("reset TCP pose must be a finite 9D vector")
+        if any(not np.isfinite(x) or x <= 0 for x in (position_tolerance_m, rotation_tolerance_rad)):
+            raise ValueError("reset TCP tolerances must be positive and finite")
+        rotation = rot6d_to_matrix(value[3:9])
+        if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0):
+            raise ValueError("reset TCP orientation must define a valid rotation")
+        native = np.r_[value[:3], self._rotation.from_matrix(rotation).as_rotvec()].tolist()
+        reference = list(config.joint_reference_rad)
+        if self._receive.isEmergencyStopped() or self._receive.isProtectiveStopped():
+            raise RuntimeError("UR safety stop is active; refusing TCP reset")
+        if not self._control.getInverseKinematicsHasSolution(native, reference):
+            raise RuntimeError("reset TCP pose has no inverse kinematics solution")
+        solution = self._control.getInverseKinematics(native, reference)
+        before = self.get_joint_positions()
+        candidates = config.target_candidates(solution, before)
+        target_config = next((candidate for candidate in candidates
+                              if self._control.isJointsWithinSafetyLimits(list(candidate.joints_rad))), None)
+        if target_config is None:
+            raise RuntimeError("no equivalent reset wrist target satisfies controller safety limits and configured travel limits")
+        target = target_config.target_from(before)
+        forward = self._reset_forward_kinematics(target)
+        if forward.shape != (6,) or not np.isfinite(forward).all():
+            raise RuntimeError("invalid forward kinematics for reset target")
+        pos_error = float(np.linalg.norm(forward[:3] - value[:3]))
+        rot_error = float((self._rotation.from_matrix(rotation).inv() * self._rotation.from_rotvec(forward[3:])).magnitude())
+        if pos_error > 1e-4 or rot_error > 1e-3:
+            raise RuntimeError(f"reset IK/FK mismatch: position={pos_error:.6f}m rotation={rot_error:.6f}rad")
+        logger.info(
+            "TCP reset joint plan: current=%s target=%s delta=%s; q6_deg=%.2f -> %.2f",
+            np.round(before, 5).tolist(), np.round(target, 5).tolist(),
+            np.round(target - before, 5).tolist(), np.degrees(before[5]), np.degrees(target[5]),
+        )
+        distance = float(np.max(np.abs(target - before)))
+        speed = float(target_config.speed_rad_s)
+        acceleration = float(target_config.acceleration_rad_s2)
+        estimated_s = (2 * np.sqrt(distance / acceleration) if distance <= speed * speed / acceleration
+                       else distance / speed + speed / acceleration)
+        logger.info("TCP reset joint profile: speed=%.3frad/s acceleration=%.3frad/s^2 estimated=%.1fs",
+                    speed, acceleration, estimated_s)
+        after = self.move_to_joint_target(target_config)
+        actual = self.get_eef_pose()
+        pos_error = float(np.linalg.norm(actual[:3] - value[:3]))
+        rot_error = float((self._rotation.from_matrix(rotation).inv() * self._rotation.from_matrix(rot6d_to_matrix(actual[3:9]))).magnitude())
+        if pos_error > position_tolerance_m or rot_error > rotation_tolerance_rad:
+            raise RuntimeError(f"TCP reset did not reach the requested pose: position={pos_error:.5f}m rotation={rot_error:.5f}rad")
+        logger.info("TCP reset joint reached: q=%s q6_deg=%.2f", np.round(after, 5).tolist(), np.degrees(after[5]))
         return after
 
     def move_to_reset_joints(
@@ -266,38 +373,15 @@ class UR7Robot:
         acceleration: float,
         joint_delta_limits_rad: np.ndarray,
     ) -> np.ndarray:
-        """Move to a bounded joint-space escape pose before Cartesian reset."""
-        if self._control is None:
-            raise PermissionError("robot adapter is read-only")
-        if self._receive.isEmergencyStopped():
-            raise RuntimeError("UR emergency stop is active; refusing reset joint motion")
-        if self._receive.isProtectiveStopped():
-            raise RuntimeError("UR protective stop is active; refusing reset joint motion")
-        target = np.asarray(joints, dtype=np.float64)
-        current = np.asarray(self._receive.getActualQ(), dtype=np.float64)
-        limits = np.asarray(joint_delta_limits_rad, dtype=np.float64)
-        if target.shape != (6,) or not np.all(np.isfinite(target)):
-            raise ValueError("reset escape joints must be a finite 6D vector")
-        if current.shape != (6,) or not np.all(np.isfinite(current)):
-            raise RuntimeError(f"invalid UR joint state: shape={current.shape}")
-        if limits.shape != (6,) or not np.all(np.isfinite(limits)) or np.any(limits <= 0):
-            raise ValueError("reset escape joint limits must be a positive finite 6D vector")
-        nearest = target + 2 * np.pi * np.round((current - target) / (2 * np.pi))
-        deltas = np.abs(nearest - current)
-        if np.any(deltas > limits):
-            axis = int(np.argmax(deltas / limits))
-            raise RuntimeError(
-                f"reset joint escape q{axis + 1} motion too large: "
-                f"{deltas[axis]:.4f}rad > {limits[axis]:.4f}rad"
+        """Compatibility entry point with the same exact-branch reset checks."""
+        return self.move_to_joint_target(
+            JointResetConfig(
+                joints_rad=tuple(joints),
+                speed_rad_s=speed,
+                acceleration_rad_s2=acceleration,
+                max_delta_rad=tuple(joint_delta_limits_rad),
             )
-        accepted = self._control.moveJ(
-            nearest.tolist(),
-            float(speed),
-            float(acceleration),
         )
-        if not accepted:
-            raise RuntimeError("UR joint escape moveJ command was rejected")
-        return nearest
 
     def move_q6_to_reset_branch(
         self,
@@ -312,8 +396,8 @@ class UR7Robot:
     ) -> np.ndarray:
         """Move only wrist-3 to one explicit, non-periodic reset branch.
 
-        Unlike :meth:`move_to_reset_joints`, this method deliberately does not
-        resolve a ``2π``-equivalent target. The caller must provide the reviewed
+        Like :meth:`move_to_reset_joints`, this method does not resolve a
+        ``2π``-equivalent target. The caller must provide the reviewed
         unwrapped q6 branch. This prevents a near-limit q6 from being mapped to
         an even more extreme periodic equivalent.
         """
@@ -436,7 +520,7 @@ class UR7Robot:
         if not accepted:
             raise RuntimeError("UR servoL command was rejected")
         if command_gripper and self._gripper:
-            self._gripper.set_open_fraction(float(value[9]))
+            self._gripper.set_open_fraction(float(value[9]), speed=self._gripper_speed)
 
     def recover_protective_stop(self) -> bool:
         """Explicitly unlock one active Protective Stop and restore RTDE control.
@@ -490,7 +574,7 @@ class UR7Robot:
             raise RuntimeError("UR emergency stop is active; refusing gripper reset")
         if self._receive.isProtectiveStopped():
             raise RuntimeError("UR protective stop is active; refusing gripper reset")
-        self._gripper.set_open_fraction(1.0)
+        self._gripper.set_open_fraction(1.0, speed=self._gripper_speed)
 
     def stop(self) -> None:
         """Stop servo mode without clearing safety faults."""

@@ -136,6 +136,22 @@ class FakeUR7Robot:
         if self._state.shape != (22,):
             raise ValueError("FakeUR7Robot state must be 22D")
         self.actions: list[np.ndarray] = []
+        self._joints = np.asarray([1.5, -1.5, 1.5, -1.5, -1.5, 0.0], dtype=np.float64)
+
+    def get_joint_positions(self) -> np.ndarray:
+        return self._joints.copy()
+
+    def move_to_joint_target(self, config) -> np.ndarray:
+        # Joint-only simulation: deliberately does not invent a forward
+        # kinematics result for the fake EEF observation.
+        self._joints = config.target_from(self._joints)
+        return self.get_joint_positions()
+
+    def move_to_pose_on_joint_branch(self, pose, config, **kwargs) -> np.ndarray:
+        # No-hardware simulation only: use the reference branch, not a fake IK.
+        self._joints = config.target_config(config.joint_reference_rad).target_from(self._joints)
+        self._state[:9] = np.asarray(pose, dtype=np.float64)
+        return self.get_joint_positions()
 
     def get_state(self) -> np.ndarray:
         return self._state.copy()

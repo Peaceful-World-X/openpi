@@ -130,6 +130,8 @@ def main() -> None:
             execute=True,
             confirmation=args.confirm,
             gripper_connection=_get(config, "robot", "gripper_connection"),
+            gripper_speed=float(_get(config, "robot", "gripper_speed", default=0.3)),
+            tcp_offset=_get(config, "robot", "tcp_offset"),
             servo=ServoConfig(
                 acceleration=float(_get(config, "robot", "servo", "acceleration", default=0.3)),
                 velocity=float(_get(config, "robot", "servo", "velocity", default=0.15)),

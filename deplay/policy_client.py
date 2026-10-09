@@ -145,6 +145,7 @@ class WebSocketPolicyClient:
                 self._debug_request_id += 1
                 started_s = time.monotonic()
                 debug_event: dict[str, Any] = {
+                    "event_type": "inference",
                     "request_id": request_id,
                     "attempt": attempt,
                     "started_monotonic_s": started_s,

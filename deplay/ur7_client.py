@@ -14,7 +14,10 @@ import argparse
 import base64
 from collections.abc import Callable
 from collections.abc import Mapping
+from dataclasses import asdict
 from dataclasses import replace
+import copy
+import queue
 from datetime import datetime
 from datetime import timezone
 from io import BytesIO
@@ -35,6 +38,8 @@ from .ur7.robot import EXECUTE_CONFIRMATION
 from .ur7.robot import ServoConfig
 from .ur7.robot import StateConfig
 from .ur7.robot import UR7Robot
+from .ur7.joint_reset import JointResetConfig
+from .ur7.cartesian_reset import CartesianResetConfig
 from .ur7.se3 import interpolate_absolute_action
 from .interactive import InteractiveUR7Controller
 from .ur7_client_utils import AbsoluteChunkPolicy
@@ -76,6 +81,7 @@ class UR7DeploymentClient:
         safety: SafetyLimits | None = None,
         image_size: int = 224,
         flip_wrist_image: bool = False,
+        debug_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if control_hz <= 0:
             raise ValueError("control_hz must be positive")
@@ -100,9 +106,22 @@ class UR7DeploymentClient:
             pose_aware_rtc=pose_aware_rtc,
             rtc_enabled=rtc_enabled,
         )
+        self._debug_callback = debug_callback
+        self._debug_step_id = 0
+        self._debug_generation = 0
         self._initialized = False
         self._motion_lock = threading.RLock()
         self._reset_thread: threading.Thread | None = None
+
+    def _trace(self, event_type: str, **fields: Any) -> None:
+        if self._debug_callback is not None:
+            try:
+                self._debug_callback({
+                    "event_type": event_type, "monotonic_s": time.monotonic(),
+                    "generation": self._debug_generation, **fields,
+                })
+            except Exception:
+                logger.exception("could not record action trace")
 
     def observation(self) -> dict[str, Any]:
         images = self.image_reader()
@@ -163,12 +182,37 @@ class UR7DeploymentClient:
         action, info = self.chunks.step(observation)
         action = self._decode_action(action, observation)
         state = np.asarray(self.robot.get_state(), dtype=np.float64)
+        step_id = self._debug_step_id
+        self._debug_step_id += 1
+        self._trace(
+            "action_selected", step_id=step_id, scheduler=asdict(info),
+            observation_state=observation["state"], state_before=state,
+            action=action, execute_enabled=bool(getattr(self.robot, "execute_enabled", False)),
+        )
         safe_action = self._validate(action, state)
         with self._motion_lock:
             if motion_allowed is not None and not motion_allowed():
                 raise InterruptedError("client motion was stopped before action execution")
+            if info.chunk_index == 0:
+                logger.info(
+                    "action target: chunk=%d index=%d actual_xyz=%s target_xyz=%s "
+                    "delta_xyz_m=%s gripper=%.4f fused_steps=%d",
+                    info.chunk_id,
+                    info.chunk_index,
+                    np.round(state[:3], 5).tolist(),
+                    np.round(safe_action[:3], 5).tolist(),
+                    np.round(safe_action[:3] - state[:3], 5).tolist(),
+                    safe_action[9],
+                    info.fused_overlap_steps,
+                )
             if getattr(self.robot, "execute_enabled", False):
-                self.robot.send_absolute_action(safe_action, command_gripper=True)
+                command_started = time.monotonic()
+                try:
+                    self.robot.send_absolute_action(safe_action, command_gripper=True)
+                except BaseException as error:
+                    self._trace("action_error", step_id=step_id, error=repr(error))
+                    raise
+                self._trace("action_sent", step_id=step_id, command_duration_s=time.monotonic() - command_started)
             else:
                 logger.info(
                     "dry-run action chunk=%d index=%d target=%s",
@@ -178,6 +222,10 @@ class UR7DeploymentClient:
                 )
         # Capture the post-action observation before scheduling RTC prefetch.
         current_observation = self.observation()
+        self._trace(
+            "action_observed", step_id=step_id, state_after=current_observation["state"],
+            elapsed_s=time.monotonic() - started,
+        )
         if self.chunks.prefetch(current_observation) and not info.prefetch_started:
             info = replace(info, prefetch_started=True)
         remaining = self.period_s - (time.monotonic() - started)
@@ -190,6 +238,8 @@ class UR7DeploymentClient:
         with self._motion_lock:
             self.chunks.reset()
             self._initialized = False
+            self._debug_generation += 1
+            self._trace("chunks_reset")
 
     def stop(self, *, wait_for_scheduler: bool = True) -> None:
         """Stop robot servo output and invalidate pending actions."""
@@ -204,6 +254,22 @@ class UR7DeploymentClient:
             )
             self._reset_thread.start()
 
+    def move_to_joints(self, config: JointResetConfig) -> None:
+        """Reset the exact joint branch under the same lock as policy writes."""
+        with self._motion_lock:
+            current = self.robot.get_joint_positions()
+            target = config.target_from(current)
+            logger.info(
+                "joint reset current=%s target=%s delta=%s",
+                np.round(current, 5).tolist(), np.round(target, 5).tolist(),
+                np.round(target - current, 5).tolist(),
+            )
+            if getattr(self.robot, "execute_enabled", False) or getattr(self.robot, "simulate_motion", False):
+                actual = self.robot.move_to_joint_target(config)
+                logger.info("joint reset reached=%s", np.round(actual, 5).tolist())
+            else:
+                logger.info("dry-run joint reset; no motion sent")
+
     def move_to_pose(
         self,
         pose: Any,
@@ -213,8 +279,9 @@ class UR7DeploymentClient:
         rotation_tolerance_rad: float | None = None,
         workspace_min: Any | None = None,
         workspace_max: Any | None = None,
+        joint_reset_config: CartesianResetConfig | None = None,
     ) -> None:
-        """Move to a configured 9D EEF pose using bounded interpolated targets."""
+        """Reset a TCP pose on a fixed joint branch when configured."""
         target_pose = np.asarray(pose, dtype=np.float64)
         if target_pose.shape != (9,) or not np.isfinite(target_pose).all():
             raise ValueError("EEF pose must be a finite 9D xyz+rot6d vector")
@@ -237,6 +304,16 @@ class UR7DeploymentClient:
         if upper is not None and np.any(target_pose[:3] > upper):
             raise ValueError("target EEF pose is above workspace_max")
         with self._motion_lock:
+            if joint_reset_config is not None:
+                if getattr(self.robot, "execute_enabled", False) or getattr(self.robot, "simulate_motion", False):
+                    self.robot.move_to_pose_on_joint_branch(
+                        target_pose, joint_reset_config,
+                        position_tolerance_m=position_tolerance_m or 0.01,
+                        rotation_tolerance_rad=rotation_tolerance_rad or 0.05,
+                    )
+                else:
+                    logger.info("dry-run joint reset: TCP target=%s joint reference=%s", target_pose.tolist(), joint_reset_config.joint_reference_rad)
+                return
             current_state = np.asarray(self.robot.get_state(), dtype=np.float64)
             current = current_state[:9]
             gripper = float(current_state[9])
@@ -399,11 +476,14 @@ def _make_debug_recorder(path: str | Path) -> tuple[Callable[[dict[str, Any]], N
     image_dir.mkdir(parents=True, exist_ok=True)
     stream = log_path.open("a", encoding="utf-8")
     write_lock = threading.Lock()
+    pending: queue.Queue = queue.Queue(maxsize=512)
+    closed = False
+    dropped = 0
 
-    def record(event: dict[str, Any]) -> None:
+    def write_event(event: dict[str, Any]) -> None:
         payload = dict(event)
         payload["schema_version"] = 1
-        payload["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+        payload.setdefault("timestamp_utc", datetime.now(timezone.utc).isoformat())
         observation = payload.get("observation")
         if isinstance(observation, Mapping):
             observation = dict(observation)
@@ -434,11 +514,47 @@ def _make_debug_recorder(path: str | Path) -> tuple[Callable[[dict[str, Any]], N
             stream.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
             stream.flush()
 
+    def writer() -> None:
+        while True:
+            event = pending.get()
+            try:
+                if event is None:
+                    return
+                write_event(event)
+            except Exception:
+                logger.exception("failed to write trace event to %s", log_path)
+            finally:
+                pending.task_done()
+
+    worker = threading.Thread(target=writer, name="ur7-trace-writer", daemon=True)
+    worker.start()
+
+    def record(event: dict[str, Any]) -> None:
+        nonlocal dropped
+        if closed:
+            return
+        # Camera/NumPy buffers can be reused; freeze before background encoding.
+        payload = copy.deepcopy(event)
+        payload.setdefault("timestamp_utc", datetime.now(timezone.utc).isoformat())
+        try:
+            pending.put_nowait(payload)
+        except queue.Full:
+            dropped += 1
+            if dropped == 1:
+                logger.error("trace queue full; events are being dropped: %s", log_path)
+
     def close() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        pending.put(None)
+        worker.join()
         with write_lock:
-            if not stream.closed:
-                stream.flush()
-                stream.close()
+            if dropped:
+                stream.write(json.dumps({"event_type": "trace_dropped", "count": dropped}) + "\n")
+            stream.flush()
+            stream.close()
 
     return record, close
 
@@ -446,11 +562,13 @@ def _make_debug_recorder(path: str | Path) -> tuple[Callable[[dict[str, Any]], N
 class _SessionDebugRecorder:
     """Create a fresh log and image directory for every completed reset."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, metadata: dict[str, Any] | None = None):
         self._base_path = Path(path).expanduser()
         self._record: Callable[[dict[str, Any]], None] | None = None
         self._close: Callable[[], None] = lambda: None
         self._session = 0
+        self._run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self._metadata = metadata or {}
         self._lock = threading.RLock()
 
     def start_session(self) -> None:
@@ -459,8 +577,9 @@ class _SessionDebugRecorder:
             self._session += 1
             suffix = self._base_path.suffix or ".jsonl"
             stem = self._base_path.stem
-            path = self._base_path.with_name(f"{stem}_session_{self._session:03d}{suffix}")
+            path = self._base_path.with_name(f"{stem}_{self._run_id}_session_{self._session:03d}{suffix}")
             self._record, self._close = _make_debug_recorder(path)
+            self._record({"event_type": "session_start", "metadata": self._metadata})
             logger.info("started policy debug session %03d: %s", self._session, path)
 
     def __call__(self, event: dict[str, Any]) -> None:
@@ -548,6 +667,14 @@ def main() -> None:
         parser.error("--task or config task is required")
     if args.interactive is None:
         args.interactive = not args.smoke
+    reset_joints = home_joints = None
+    if args.interactive:
+        try:
+            reset_mapping = config.get("reset", {})
+            reset_joints = JointResetConfig.from_mapping(reset_mapping)
+            home_joints = JointResetConfig.from_mapping({**reset_mapping, **config.get("home", {})})
+        except (TypeError, ValueError) as error:
+            parser.error(f"reset/home requires valid absolute joints_rad: {error}")
     debug_enabled = bool(args.debug or _cfg(config, "debug", "enabled", default=False))
     debug_close: Callable[[], None] = lambda: None
     debug_callback: Callable[[dict[str, Any]], None] | None = None
@@ -559,7 +686,13 @@ def main() -> None:
         else:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             debug_path = Path(".data") / "debug" / f"ur7_client_{stamp}.jsonl"
-        debug_recorder = _SessionDebugRecorder(debug_path)
+        debug_recorder = _SessionDebugRecorder(debug_path, metadata={
+            "config": config, "server": server, "action_space": action_space,
+            "control_hz": control_hz, "rtc_enabled": rtc_enabled,
+            "rtc_overlap": rtc_overlap, "prefetch_remaining": prefetch_remaining,
+            "action_chunk_size": action_chunk_size, "execute_horizon": execute_horizon,
+            "inference_delay": inference_delay, "execute": args.execute,
+        })
         debug_callback = debug_recorder
         debug_close = debug_recorder.close
         logger.info("policy debug logging enabled; a new session starts after reset")
@@ -601,6 +734,8 @@ def main() -> None:
             execute=args.execute,
             confirmation=args.confirm,
             gripper_connection=gripper_connection,
+            gripper_speed=float(_cfg(config, "robot", "gripper_speed", default=0.3)),
+            tcp_offset=_cfg(config, "robot", "tcp_offset"),
             state=StateConfig(
                 include_force_torque=bool(_cfg(config, "robot", "state", "include_force_torque", default=True)),
                 include_velocity=bool(_cfg(config, "robot", "state", "include_velocity", default=True)),
@@ -634,6 +769,7 @@ def main() -> None:
         action_space=action_space,
         image_size=int(_cfg(config, "control", "image_size", default=224)),
         flip_wrist_image=bool(_cfg(config, "cameras", "wrist", "horizontal_flip", default=False)),
+        debug_callback=debug_callback,
         safety=SafetyLimits(
             max_translation_step_m=float(_cfg(config, "safety", "max_translation_step_m", default=0.05)),
             max_rotation_step_rad=float(_cfg(config, "safety", "max_rotation_step_rad", default=0.35)),
@@ -641,25 +777,23 @@ def main() -> None:
             workspace_max=tuple(_cfg(config, "safety", "workspace_max", default=[])) or None,
         ),
     )
+    def trace_reset() -> None:
+        state = robot.get_state()
+        logger.info("joint reset TCP state: xyz=%s rot6d=%s", np.round(state[:3], 5).tolist(), np.round(state[3:9], 5).tolist())
+        if debug_recorder is not None:
+            debug_recorder.start_session()
+            client._trace("reset_state", state=state, joints=robot.get_joint_positions())
+
     try:
         if args.interactive:
-            # vla-sft's reviewed UR7 pose is stored in client.yaml. The
-            # fallback keeps xyz at zero and uses a valid identity rot6d.
-            reset_pose = _cfg(config, "reset", "eef_pose", default=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-            home_pose = _cfg(config, "home", "eef_pose", default=reset_pose)
             controller = InteractiveUR7Controller(
                 client,
-                reset_pose=reset_pose,
-                home_pose=home_pose,
-                reset_duration_s=float(_cfg(config, "reset", "duration_s", default=1.5)),
-                position_tolerance_m=float(_cfg(config, "reset", "position_tolerance_m", default=0.01)),
-                rotation_tolerance_rad=float(_cfg(config, "reset", "rotation_tolerance_rad", default=0.05)),
+                reset_joints=reset_joints,
+                home_joints=home_joints,
                 gripper_open_wait_s=float(_cfg(config, "reset", "gripper_open_wait_s", default=0.8)),
                 gripper_open_min=float(_cfg(config, "reset", "gripper_open_min", default=0.95)),
-                workspace_min=_cfg(config, "safety", "workspace_min"),
-                workspace_max=_cfg(config, "safety", "workspace_max"),
                 control_hz=float(control_hz),
-                on_reset=debug_recorder.start_session if debug_recorder is not None else None,
+                on_reset=trace_reset,
             )
             completed = controller.run(max_steps=args.steps if args.steps else None)
             logger.info("interactive session completed %d action steps", completed)

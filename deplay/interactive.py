@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable
 
 from .keyboard import TerminalKeyReader
+from .ur7.joint_reset import JointResetConfig
 
 logger = logging.getLogger(__name__)
 
@@ -36,28 +37,18 @@ class InteractiveUR7Controller:
         self,
         client: Any,
         *,
-        reset_pose: Any,
-        home_pose: Any,
-        reset_duration_s: float,
-        position_tolerance_m: float | None,
-        rotation_tolerance_rad: float | None,
+        reset_joints: JointResetConfig,
+        home_joints: JointResetConfig,
         gripper_open_wait_s: float,
         gripper_open_min: float,
-        workspace_min: Any | None,
-        workspace_max: Any | None,
         control_hz: float,
         on_reset: Callable[[], None] | None = None,
     ):
         self.client = client
-        self.reset_pose = reset_pose
-        self.home_pose = home_pose
-        self.reset_duration_s = float(reset_duration_s)
-        self.position_tolerance_m = position_tolerance_m
-        self.rotation_tolerance_rad = rotation_tolerance_rad
+        self.reset_joints = reset_joints
+        self.home_joints = home_joints
         self.gripper_open_wait_s = float(gripper_open_wait_s)
         self.gripper_open_min = float(gripper_open_min)
-        self.workspace_min = workspace_min
-        self.workspace_max = workspace_max
         self.control_period_s = 1.0 / float(control_hz)
         self.on_reset = on_reset
         self.state = WAIT_RESET
@@ -70,14 +61,7 @@ class InteractiveUR7Controller:
     def _reset(self) -> None:
         self.state = RESETTING
         self.client.stop()
-        self.client.move_to_pose(
-            self.reset_pose,
-            duration_s=self.reset_duration_s,
-            position_tolerance_m=self.position_tolerance_m,
-            rotation_tolerance_rad=self.rotation_tolerance_rad,
-            workspace_min=self.workspace_min,
-            workspace_max=self.workspace_max,
-        )
+        self.client.move_to_joints(self.reset_joints)
         if self.on_reset is not None:
             self.on_reset()
         self.state = STOPPED
@@ -110,14 +94,8 @@ class InteractiveUR7Controller:
             handled = True
             self.state = HOMING
             try:
-                self.client.move_to_pose(
-                    self.home_pose,
-                    duration_s=self.reset_duration_s,
-                    position_tolerance_m=self.position_tolerance_m,
-                    rotation_tolerance_rad=self.rotation_tolerance_rad,
-                    workspace_min=self.workspace_min,
-                    workspace_max=self.workspace_max,
-                )
+                self.client.stop()
+                self.client.move_to_joints(self.home_joints)
                 if self.on_reset is not None:
                     self.on_reset()
             finally:
