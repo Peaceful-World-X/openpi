@@ -55,6 +55,7 @@ class InteractiveUR7Controller:
         self._error: BaseException | None = None
         self._worker: threading.Thread | None = None
         self._worker_result = 0
+        self._worker_done = threading.Event()
         self._quit_requested = False
         self._run_generation = 0
 
@@ -128,8 +129,11 @@ class InteractiveUR7Controller:
             except BaseException as error:
                 self._error = error
                 self._worker_result = -1
+            finally:
+                self._worker_done.set()
 
         self._worker_result = 0
+        self._worker_done.clear()
         self._worker = threading.Thread(target=work, name="ur7-policy-step", daemon=True)
         self._worker.start()
 
@@ -157,6 +161,10 @@ class InteractiveUR7Controller:
                             self.client.stop()
                     if self.state == RUNNING and self._worker is None:
                         self._start_step(self._run_generation)
+                    elif self._worker is not None:
+                        # Wake as soon as the servo step completes, instead
+                        # of adding up to 20 ms of keyboard polling jitter.
+                        self._worker_done.wait(min(0.02, self.control_period_s))
                     else:
                         time.sleep(min(0.02, self.control_period_s))
                     if self.state == STOPPED and max_steps is not None and completed >= max_steps:

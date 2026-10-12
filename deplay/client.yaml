@@ -17,13 +17,9 @@ control:
 
 rtc:
   enabled: true
-  action_chunk_size: 16
-  execute_horizon: 15
-  inference_delay_steps: 3
-  prefix_attention_schedule: exp
-  prefetch_remaining_steps: 3
-  rtc_overlap_steps: 2
-  pose_aware: false
+  reinfer: 30               # RTC: 执行多少步数后请求；关闭 RTC: 每次同步取此步数
+  blend: 16                 # 删除已过去动作后，从剩余新动作开头融合的步数
+  inference_delay_steps: 3  # 初始估计；满 10 次后按最近 10 次平均耗时自动更新
 
 replay:
   action_column: action

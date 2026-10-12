@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from .robotiq_tcp import RobotiqTCP
+from .robotiq_tcp import AsyncRobotiqTCP
 from .se3 import matrix_to_rot6d, rot6d_to_matrix
 from .joint_reset import JointResetConfig
 from .cartesian_reset import CartesianResetConfig
@@ -76,6 +77,7 @@ class UR7Robot:
         servo: ServoConfig | None = None,
         teleoperation_servo: ServoConfig | None = None,
         state: StateConfig | None = None,
+        background_gripper: bool = False,
     ):
         if execute and confirmation != EXECUTE_CONFIRMATION:
             raise PermissionError(
@@ -107,9 +109,8 @@ class UR7Robot:
                 self._control = rtde_control.RTDEControlInterface(robot_ip)
             if expected_tcp is not None:
                 configure_tcp(self._control, self._receive, robot_ip, expected_tcp)
-            self._gripper = (
-                RobotiqTCP(gripper_connection, writable=execute) if gripper_connection else None
-            )
+            gripper_type = AsyncRobotiqTCP if background_gripper else RobotiqTCP
+            self._gripper = gripper_type(gripper_connection, writable=execute) if gripper_connection else None
         except BaseException:
             # A failed TCP check must not leave a connection/register owner behind.
             try:
@@ -578,8 +579,12 @@ class UR7Robot:
 
     def stop(self) -> None:
         """Stop servo mode without clearing safety faults."""
-        if self._control is not None:
-            self._control.servoStop()
+        try:
+            if self._control is not None:
+                self._control.servoStop()
+        finally:
+            if isinstance(self._gripper, AsyncRobotiqTCP):
+                self._gripper.cancel_pending()
 
     def close(self) -> None:
         """Stop and disconnect all interfaces."""

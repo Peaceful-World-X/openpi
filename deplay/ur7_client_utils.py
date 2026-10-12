@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -80,6 +82,7 @@ class RealSensePair:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        max_frame_age_s: float = 0.5,
     ):
         try:
             import pyrealsense2 as rs
@@ -87,8 +90,29 @@ class RealSensePair:
             raise RuntimeError("pyrealsense2 is required for RealSense deployment") from error
         self._rs = rs
         self._pipelines = []
-        self._base = self._start(base_serial, width, height, fps)
-        self._wrist = self._start(wrist_serial, width, height, fps)
+        self._threads = []
+        self._closed = threading.Event()
+        self._condition = threading.Condition()
+        self._frames = {}
+        self._error = None
+        self._max_frame_age_s = float(max_frame_age_s)
+        if not np.isfinite(self._max_frame_age_s) or self._max_frame_age_s <= 0:
+            raise ValueError("max_frame_age_s must be positive and finite")
+        try:
+            self._base = self._start(base_serial, width, height, fps)
+            self._wrist = self._start(wrist_serial, width, height, fps)
+            for name, pipeline in (("base", self._base), ("wrist", self._wrist)):
+                thread = threading.Thread(target=self._capture, args=(name, pipeline), daemon=True,
+                                          name=f"ur7-camera-{name}")
+                self._threads.append(thread)
+                thread.start()
+            with self._condition:
+                if not self._condition.wait_for(lambda: len(self._frames) == 2 or self._error is not None, timeout=5):
+                    raise TimeoutError("RealSense initial frame timeout")
+            self.read()
+        except BaseException:
+            self.close()
+            raise
 
     def _start(self, serial: str | None, width: int, height: int, fps: int):
         config = self._rs.config()
@@ -102,21 +126,50 @@ class RealSensePair:
 
     @staticmethod
     def _read(pipeline):
-        frames = pipeline.wait_for_frames()
+        frames = pipeline.wait_for_frames(timeout_ms=1000)
         frame = frames.get_color_frame()
         if not frame:
             raise RuntimeError("RealSense color frame is unavailable")
-        return np.asanyarray(frame.get_data())
+        return np.asanyarray(frame.get_data()).copy()
+
+    def _capture(self, name, pipeline) -> None:
+        try:
+            while not self._closed.is_set():
+                image = self._read(pipeline)
+                with self._condition:
+                    self._frames[name] = (time.monotonic(), image)
+                    self._condition.notify_all()
+        except Exception as error:
+            if not self._closed.is_set():
+                with self._condition:
+                    self._error = error
+                    self._condition.notify_all()
+
+    def check_health(self) -> None:
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError("RealSense background capture failed") from self._error
+            if self._closed.is_set() or len(self._frames) != 2:
+                raise RuntimeError("RealSense frames unavailable")
+            now = time.monotonic()
+            for name, (captured, _) in self._frames.items():
+                if now - captured > self._max_frame_age_s:
+                    raise RuntimeError(f"RealSense {name} frame is stale ({now - captured:.3f}s)")
 
     def read(self) -> dict[str, np.ndarray]:
-        return {"base": self._read(self._base), "wrist": self._read(self._wrist)}
+        self.check_health()
+        with self._condition:
+            return {name: frame.copy() for name, (_, frame) in self._frames.items()}
 
     def close(self) -> None:
+        self._closed.set()
         for pipeline in self._pipelines:
             try:
                 pipeline.stop()
             except Exception:
                 logger.debug("failed to stop RealSense pipeline", exc_info=True)
+        for thread in self._threads:
+            thread.join(timeout=1.5)
 
 
 # 无硬件 smoke 测试使用的假机器人。

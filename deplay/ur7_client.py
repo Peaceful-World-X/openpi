@@ -33,6 +33,7 @@ import numpy as np
 
 from .async_chunk_client import AsyncChunkClient
 from .async_chunk_client import ChunkStepInfo
+from .async_chunk_client import validate_rtc_config
 from .policy_client import WebSocketPolicyClient
 from .ur7.robot import EXECUTE_CONFIRMATION
 from .ur7.robot import ServoConfig
@@ -69,13 +70,9 @@ class UR7DeploymentClient:
         *,
         task: str,
         control_hz: float = 10.0,
-        prefetch_remaining_steps: int = 3,
-        rtc_overlap_steps: int = 2,
-        action_chunk_size: int | None = None,
-        execute_horizon: int | None = None,
-        inference_delay_steps: int = 0,
-        prefix_attention_schedule: str = "exp",
-        pose_aware_rtc: bool = False,
+        reinfer: int = 30,
+        blend: int = 16,
+        inference_delay_steps: int = 4,
         rtc_enabled: bool = True,
         action_space: str = "absolute",
         safety: SafetyLimits | None = None,
@@ -89,6 +86,7 @@ class UR7DeploymentClient:
             raise ValueError("action_space must be absolute or relative_se3")
         self.robot = robot
         self.image_reader = image_reader
+        self._image_health_check = getattr(getattr(image_reader, "__self__", None), "check_health", None)
         self.task = str(task)
         self.period_s = 1.0 / float(control_hz)
         self.action_space = action_space
@@ -97,19 +95,18 @@ class UR7DeploymentClient:
         self.flip_wrist_image = bool(flip_wrist_image)
         self.chunks = AsyncChunkClient(
             AbsoluteChunkPolicy(policy, action_space),
-            prefetch_remaining_steps=prefetch_remaining_steps,
-            rtc_overlap_steps=rtc_overlap_steps,
-            action_chunk_size=action_chunk_size,
-            execute_horizon=execute_horizon,
+            reinfer=reinfer,
+            blend=blend,
             inference_delay_steps=inference_delay_steps,
-            prefix_attention_schedule=prefix_attention_schedule,
-            pose_aware_rtc=pose_aware_rtc,
+            control_period_s=self.period_s,
             rtc_enabled=rtc_enabled,
         )
         self._debug_callback = debug_callback
         self._debug_step_id = 0
         self._debug_generation = 0
         self._initialized = False
+        self._last_command_started = None
+        self._last_period_warning = 0.0
         self._motion_lock = threading.RLock()
         self._reset_thread: threading.Thread | None = None
 
@@ -174,14 +171,15 @@ class UR7DeploymentClient:
         if self._reset_thread is not None:
             self._reset_thread.join()
             self._reset_thread = None
-        observation = self.observation()
-        if not self._initialized:
-            self.chunks.initialize(observation)
-            self._initialized = True
         started = time.monotonic()
+        if self._image_health_check is not None:
+            self._image_health_check()
+        observation = self.observation() if self.chunks.needs_observation else {}
         action, info = self.chunks.step(observation)
-        action = self._decode_action(action, observation)
+        self._initialized = True
         state = np.asarray(self.robot.get_state(), dtype=np.float64)
+        observation = {"state": state}
+        action = self._decode_action(action, observation)
         step_id = self._debug_step_id
         self._debug_step_id += 1
         self._trace(
@@ -207,6 +205,13 @@ class UR7DeploymentClient:
                 )
             if getattr(self.robot, "execute_enabled", False):
                 command_started = time.monotonic()
+                if self._last_command_started is not None:
+                    interval = command_started - self._last_command_started
+                    if interval > self.period_s * 1.25 and command_started - self._last_period_warning > 2:
+                        logger.warning("servo command interval %.1f ms exceeds target %.1f ms",
+                                       interval * 1000, self.period_s * 1000)
+                        self._last_period_warning = command_started
+                self._last_command_started = command_started
                 try:
                     self.robot.send_absolute_action(safe_action, command_gripper=True)
                 except BaseException as error:
@@ -220,14 +225,17 @@ class UR7DeploymentClient:
                     info.chunk_index,
                     np.round(safe_action, 5).tolist(),
                 )
-        # Capture the post-action observation before scheduling RTC prefetch.
-        current_observation = self.observation()
-        self._trace(
-            "action_observed", step_id=step_id, state_after=current_observation["state"],
-            elapsed_s=time.monotonic() - started,
-        )
-        if self.chunks.prefetch(current_observation) and not info.prefetch_started:
-            info = replace(info, prefetch_started=True)
+        if self.chunks.needs_prefetch:
+            # The background camera readers return fresh snapshots without
+            # waiting for the next camera frame in the servo thread.
+            current_observation = self.observation()
+            if self.chunks.prefetch(current_observation) and not info.prefetch_started:
+                info = replace(info, prefetch_started=True)
+        if self._debug_callback is not None:
+            self._trace(
+                "action_observed", step_id=step_id, state_after=self.robot.get_state(),
+                elapsed_s=time.monotonic() - started,
+            )
         remaining = self.period_s - (time.monotonic() - started)
         if remaining > 0:
             time.sleep(remaining)
@@ -238,6 +246,7 @@ class UR7DeploymentClient:
         with self._motion_lock:
             self.chunks.reset()
             self._initialized = False
+            self._last_command_started = None
             self._debug_generation += 1
             self._trace("chunks_reset")
 
@@ -608,17 +617,12 @@ def main() -> None:
     parser.add_argument("--task", default=None)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--control-hz", type=float, default=None)
-    parser.add_argument("--prefetch-remaining", type=int, default=None)
-    parser.add_argument("--rtc-overlap", type=int, default=None)
-    parser.add_argument("--action-chunk-size", type=int, default=None)
-    parser.add_argument("--execute-horizon", type=int, default=None)
-    parser.add_argument("--inference-delay", type=int, default=None)
-    parser.add_argument("--prefix-attention-schedule", choices=("linear", "exp", "ones", "zeros"), default=None)
-    parser.add_argument(
-        "--pose-aware-rtc",
-        action="store_true",
-        help="use SE(3) interpolation in the blend interval instead of reference elementwise mixing",
-    )
+    parser.add_argument("--reinfer", type=int, default=None,
+                        help="RTC queue threshold; synchronous actions per request when RTC is off")
+    parser.add_argument("--blend", type=int, default=None,
+                        help="number of new actions blended after removing elapsed actions")
+    parser.add_argument("--inference-delay-steps", type=int, default=None,
+                        help="initial delay; adapts from the mean of the last 10 async requests")
     parser.add_argument("--action-space", choices=("absolute", "relative_se3"), default=None)
     parser.add_argument("--robot-ip", default=None)
     parser.add_argument("--gripper-connection", default=None)
@@ -627,7 +631,7 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm")
     parser.add_argument("--rtc", dest="rtc_enabled", action="store_true", help="enable time-aligned RTC fusion")
-    parser.add_argument("--no-rtc", dest="rtc_enabled", action="store_false", help="disable fusion; keep async prefetch")
+    parser.add_argument("--no-rtc", dest="rtc_enabled", action="store_false", help="synchronous inference, execute reinfer actions per request")
     parser.add_argument("--smoke", action="store_true", help="Use a fake robot and black images")
     parser.add_argument(
         "--debug",
@@ -649,12 +653,22 @@ def main() -> None:
     server = args.server or _cfg(config, "server", "uri", default="ws://127.0.0.1:8000")
     task = args.task or _cfg(config, "task", default="")
     control_hz = args.control_hz or _cfg(config, "control", "control_hz", default=10.0)
-    prefetch_remaining = args.prefetch_remaining if args.prefetch_remaining is not None else _cfg(config, "rtc", "prefetch_remaining_steps", default=3)
-    rtc_overlap = args.rtc_overlap if args.rtc_overlap is not None else _cfg(config, "rtc", "rtc_overlap_steps", default=2)
-    action_chunk_size = args.action_chunk_size or _cfg(config, "rtc", "action_chunk_size", default=16)
-    execute_horizon = args.execute_horizon or _cfg(config, "rtc", "execute_horizon", default=8)
-    inference_delay = args.inference_delay if args.inference_delay is not None else _cfg(config, "rtc", "inference_delay_steps", default=3)
-    prefix_schedule = args.prefix_attention_schedule or _cfg(config, "rtc", "prefix_attention_schedule", default="exp")
+    rtc_config = config.get("rtc", {})
+    if not isinstance(rtc_config, Mapping):
+        parser.error("rtc must contain enabled, reinfer, blend and inference_delay_steps")
+    unknown = set(rtc_config) - {"enabled", "reinfer", "blend", "inference_delay_steps"}
+    if unknown:
+        parser.error(f"obsolete/unknown rtc keys: {sorted(unknown)}; use enabled, reinfer, blend, inference_delay_steps")
+    reinfer = args.reinfer if args.reinfer is not None else rtc_config.get("reinfer", 30)
+    blend = args.blend if args.blend is not None else rtc_config.get("blend", 16)
+    inference_delay_steps = (args.inference_delay_steps if args.inference_delay_steps is not None
+                             else rtc_config.get("inference_delay_steps", 4))
+    try:
+        validate_rtc_config(reinfer, blend, inference_delay_steps)
+    except ValueError as error:
+        parser.error(str(error))
+    if "enabled" in rtc_config and not isinstance(rtc_config["enabled"], bool):
+        parser.error("rtc.enabled must be a YAML boolean")
     rtc_enabled = (
         bool(_cfg(config, "rtc", "enabled", default=False))
         if args.rtc_enabled is None
@@ -689,9 +703,8 @@ def main() -> None:
         debug_recorder = _SessionDebugRecorder(debug_path, metadata={
             "config": config, "server": server, "action_space": action_space,
             "control_hz": control_hz, "rtc_enabled": rtc_enabled,
-            "rtc_overlap": rtc_overlap, "prefetch_remaining": prefetch_remaining,
-            "action_chunk_size": action_chunk_size, "execute_horizon": execute_horizon,
-            "inference_delay": inference_delay, "execute": args.execute,
+            "reinfer": reinfer, "blend": blend, "execute": args.execute,
+            "initial_inference_delay_steps": inference_delay_steps,
         })
         debug_callback = debug_recorder
         debug_close = debug_recorder.close
@@ -731,6 +744,7 @@ def main() -> None:
         )
         robot = UR7Robot(
             robot_ip,
+            background_gripper=True,
             execute=args.execute,
             confirmation=args.confirm,
             gripper_connection=gripper_connection,
@@ -758,13 +772,9 @@ def main() -> None:
         image_reader,
         task=task,
         control_hz=control_hz,
-        prefetch_remaining_steps=prefetch_remaining,
-        rtc_overlap_steps=rtc_overlap,
-        action_chunk_size=action_chunk_size,
-        execute_horizon=execute_horizon,
-        inference_delay_steps=inference_delay,
-        prefix_attention_schedule=prefix_schedule,
-        pose_aware_rtc=args.pose_aware_rtc or bool(_cfg(config, "rtc", "pose_aware", default=False)),
+        reinfer=reinfer,
+        blend=blend,
+        inference_delay_steps=inference_delay_steps,
         rtc_enabled=rtc_enabled,
         action_space=action_space,
         image_size=int(_cfg(config, "control", "image_size", default=224)),

@@ -119,7 +119,7 @@ cd /16T-2/sudu/code/openpi
   --timeout 180 \
   --task 'pick the randomly placed housing, lift it, reorient it upright, then stand it stably on the table' \
   --steps 16 \
-  --action-chunk-size 16 \
+  --no-rtc --reinfer 30 --blend 16 \
   --smoke
 
 ## UR7 真机运行
@@ -149,3 +149,42 @@ env -u HTTP_PROXY \
 
 
 ```
+
+
+## RTC 动作队列（2026-10-12）
+
+机械臂服务器 `/data/sudo/openpi/deplay/client.yaml` 使用以下 RTC 配置：
+
+```yaml
+rtc:
+  enabled: true
+  reinfer: 30
+  blend: 16
+  inference_delay_steps: 4
+```
+
+- 开启：使用服务端完整动作块。队列剩余 `reinfer` 步时，根据执行后的观测异步请求下一块，继续执行已有队列；响应就绪且达到该请求的估计切换步数后，在下个动作周期切换。
+- 对齐：按请求发起后实际执行的步数丢弃新预测中过去的动作，`inference_delay_steps` 仅作为初始估计。请求完成得早时继续执行旧队列直到估计切换点；请求完成得晚时按实际已执行步数切换，不额外跳到估计的未来位置。
+- 融合：先删除新预测中已经过去的动作，再对剩余新动作的前 `blend` 步与旧队列同一时刻的动作作线性权重融合，旋转使用 SE(3) 插值。如果等待时已执行 4 步，跳过新块前 4 步，然后仍融合后续 16 步；旧队列剩余不足 16 步时，仅融合实际可用的重叠区间。这里实现的是客户端轨迹融合，不是模型去噪时的前缀引导。
+- 关闭：`enabled: false` 或 `--no-rtc`。每次同步推理只取前 `reinfer` 步，全部执行完后重新读取观测并推理；不预取、不丢弃开头、不融合。这种模式在两块之间有推理等待是预期行为。
+- 服务端必须返回足够长的动作块：RTC 开启时 `N > reinfer`，关闭时 `N >= reinfer`；不足直接报出参数错误。
+- RTC 下若旧队列全部耗尽且新响应尚未到达，报错停止，不无限重复最后一个目标。
+- `blend=0` 可关闭融合但保留异步预取。旧参数和旧命令行选项已移除，传入时明确报错。
+
+例如服务端返回 50 步：首次执行 20 步后剩余 30 步，开始预取；等待时又执行 4 步，则新块从第 5 步对齐切换，从第 5 步开始融合 16 步（初始延迟估计为 4）。无需等旧块用完才切换。
+
+为减少伺服线程的阻塞，两路相机后台采集，控制线程只取最新帧；夹爪由单独线程串行通信，合并重复硬件目标并缓存实测开度。相机/夹爪数据超过 0.5 秒未更新或通信失败时停止使用并报错。Replay 默认仍使用原有同步夹爪接口。停止时清除尚未发送的夹爪目标，但不会撤销已经发给夹爪的命令。
+
+日志 `RTC switch: inference_ms=... consumed=... fused=... queued=...` 用于确认推理耗时、实际跳过步数和有效融合步数。`servo command interval ... exceeds target ...` 表示命令周期超时。摄像头健康、工作空间和单步位姿限制在执行前继续检查。
+
+无硬件回归验证（不会连接机械臂）：
+
+```bash
+cd /data/sudo/openpi
+PYTHONPATH=.:packages/openpi-client/src .venv/bin/python -m unittest discover -s test -p test_rtc_runtime.py -v
+```
+
+
+延迟估计：初始使用 `inference_delay_steps`。只统计异步预取的完整往返耗时（含排队、网络和推理），不把首次同步推理/JAX 编译计入，也不把等待切换的时间计入。积累满 10 次后，用最近 10 次耗时的滑动平均更新：`延迟步数 = ceil(平均耗时 / 控制周期)`。之后每收到一个新结果更新一次。例如 10Hz、平均 0.26s 对应 3 步，平均 0.41s 对应 5 步。日志 `RTC delay: samples=10 mean_ms=... estimated_steps=...` 显示更新结果。
+
+估计用于安排下一次请求的切换时机，最多等到当前旧队列耗尽；真正裁剪量始终是请求后已执行的动作数。`blend=16` 在这个裁剪点之后开始计数。若实测延迟超出 `reinfer` 提供的缓冲，会记录告警；没有新响应时仍报错停止。停止/恢复时保留已学习的估计，重启进程后重新统计。关闭 RTC 时忽略延迟估计，不跳步。
