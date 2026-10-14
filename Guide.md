@@ -101,7 +101,7 @@ cd /data/sudo/openpi
 ```
 
 
-# 推理
+# 推理加速
 ```bash
 
 ## 启动 Policy Server
@@ -109,8 +109,8 @@ cd /16T-2/sudu/code/openpi
 export CUDA_VISIBLE_DEVICES=0 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.35
 .venv/bin/python scripts/serve_policy.py --port 9000 policy:checkpoint \
-  --policy.config=pi05_bund_demo_data_0reset_0827_v002_v21_reconstructed_lora_local4 \
-  --policy.dir=/16T-2/sudu/code/result/pi05_bund_demo_data_0reset_0827_v002_v21_reconstructed_lora_local4/ur7_pi05_lora_local4/30000
+  --policy.config=pi05_bund_20260917_n906_v21_new_80G_8gpu_full \
+  --policy.dir=/16T-2/sudu/code/.result/pi05_h20_8cards_20260929_145009/40000
 
 ## 客户端无硬件 smoke
 cd /16T-2/sudu/code/openpi
@@ -149,6 +149,108 @@ env -u HTTP_PROXY \
 
 
 ```
+
+## 推理加速
+
+```bash
+cd /16T-2/sudu/code/openpi
+export CFG=pi05_bund_20260917_n906_v21_new_80G_8gpu_full
+export BENCH=/16T-2/sudu/code/.result/inference_accel/pi05_40000
+export JAX_CKPT=/16T-2/sudu/code/.result/pi05_h20_8cards_20260929_145009/40000
+export PT_CKPT="$BENCH/pytorch_checkpoint"
+
+
+> 说明：下面的 JAX/PyTorch/FlashRT 服务命令是部署用法。40000 步实验报告中的六组延迟和精度数据不是通过 WebSocket 或 REST 测得的，而是由实验后端在同一进程中直接调用模型；因此报告延迟不包含网络和服务协议开销。要复现实验原始流程，使用：
+>
+> ```bash
+> cd /16T-2/sudu/code/openpi
+> .venv/bin/python test/inference_accel/run_accuracy.py \
+>   --root "$BENCH" --backends jax pytorch flashrt flashrt_bf16 tensorrt tensorrt_bf16 --gpu 3
+> .venv/bin/python test/inference_accel/run_sequential_latency.py \
+>   --root "$BENCH"
+> ```
+>
+> JAX 直接加载 Orbax `40000`；其余后端使用由该权重转换得到的 `pytorch_checkpoint`，TensorRT 另外读取对应的已构建引擎目录。
+
+## 1. 官方 JAX（WebSocket，直接用于 UR7）
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 \
+  .venv/bin/python scripts/serve_policy.py --port 9000 policy:checkpoint \
+  --policy.config="$CFG" \
+  --policy.dir="$JAX_CKPT"
+```
+
+## 2. 官方 PyTorch `torch.compile`（WebSocket）
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+  .venv/bin/python scripts/serve_policy.py --port 9000 policy:checkpoint \
+  --policy.config="$CFG" \
+  --policy.dir="$PT_CKPT"
+```
+
+这是官方 PyTorch `max-autotune` 路径；首次启动会加载并编译模型。
+
+## 3. FlashRT FP8 / BF16（独立 HTTP 服务或离线验证）
+FlashRT 自带的是 REST 接口，输入输出协议与 OpenPI UR7 WebSocket 协议不同；它不能直接替换当前 `deplay.ur7_client`。使用 FlashRT 通用服务时：
+
+
+cd /16T-2/sudu/code/FlashRT
+# 首次使用且环境中没有 REST 依赖时执行一次：
+/16T-2/sudu/code/openpi/test/inference_accel/flashrt_env/bin/python -m pip install fastapi uvicorn
+CUDA_VISIBLE_DEVICES=0 \
+  /16T-2/sudu/code/openpi/test/inference_accel/flashrt_env/bin/python \
+  examples/server.py \
+  --checkpoint "$PT_CKPT" --framework torch --port 9001 --num_views 2
+
+
+该服务的接口是 `POST http://127.0.0.1:9001/predict`。FP8/BF16 的本次 UR7 对照适配器可分别离线验证：
+
+cd /16T-2/sudu/code/openpi
+CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cpu \
+  PYTHONPATH=test/inference_accel/deps:src:. \
+  test/inference_accel/flashrt_env/bin/python test/inference_accel/run_latency.py \
+  --backend backend_flashrt --checkpoint "$PT_CKPT" \
+  --manifest "$BENCH/manifest.json" --output "$BENCH/latency/flashrt_fp8"
+
+OPENPI_FLASHRT_PRECISION=bf16 CUDA_VISIBLE_DEVICES=0 \
+  JAX_PLATFORMS=cpu PYTHONPATH=test/inference_accel/deps:src:. \
+  test/inference_accel/flashrt_env/bin/python test/inference_accel/run_latency.py \
+  --backend backend_flashrt --checkpoint "$PT_CKPT" \
+  --manifest "$BENCH/manifest.json" --output "$BENCH/latency/flashrt_bf16"
+
+
+
+## 4. TensorRT FP16 / BF16（已构建引擎，离线验证）
+当前 TensorRT 是 Python 驻留的三引擎实验适配版，没有接入 `scripts/serve_policy.py` 的 WebSocket 服务，也不能直接给 UR7 客户端使用。分别指定对应引擎目录进行验证：
+
+cd /16T-2/sudu/code/openpi
+OPENPI_BENCH_TRT_ENGINES="$BENCH/tensorrt/engines" \
+  JAX_PLATFORMS=cpu PYTHONPATH=test/inference_accel/deps:src:. \
+  LD_LIBRARY_PATH=/usr/local/cuda-12.3/lib64:${LD_LIBRARY_PATH:-} \
+  CUDA_VISIBLE_DEVICES=0 test/inference_accel/envs/tensorrt/bin/python \
+  test/inference_accel/run_latency.py --backend backend_tensorrt \
+  --checkpoint "$PT_CKPT" --manifest "$BENCH/manifest.json" \
+  --output "$BENCH/latency/tensorrt_fp16"
+
+OPENPI_BENCH_TRT_ENGINES="$BENCH/tensorrt_bf16/engines" \
+  JAX_PLATFORMS=cpu PYTHONPATH=test/inference_accel/deps:src:. \
+  LD_LIBRARY_PATH=/usr/local/cuda-12.3/lib64:${LD_LIBRARY_PATH:-} \
+  CUDA_VISIBLE_DEVICES=0 test/inference_accel/envs/tensorrt/bin/python \
+  test/inference_accel/run_latency.py --backend backend_tensorrt \
+  --checkpoint "$PT_CKPT" --manifest "$BENCH/manifest.json" \
+  --output "$BENCH/latency/tensorrt_bf16"
+```
+
+### 服务选择
+
+| 架构 | 精度 | 40000 权重入口 | 当前服务方式 | 能否直接接 UR7 WebSocket |
+|---|---|---|---|---|
+| JAX | 主要 BF16，部分 FP32 | Orbax `40000` | `scripts/serve_policy.py` | 可以 |
+| PyTorch compile | BF16/FP32 | `pytorch_checkpoint` | `scripts/serve_policy.py` | 可以 |
+| FlashRT | FP8 或 BF16 | `pytorch_checkpoint` | FlashRT REST 或离线适配器 | REST 不能直接替换 |
+| TensorRT | FP16 或 BF16 | `tensorrt*/engines` | 离线适配器 | 暂不可以 |
+
+如果目标是当前 UR7 真机运行，使用上面的 JAX WebSocket 命令；其余四种结果用于性能和数值对照，不能仅通过替换权重目录切换到现有 UR7 客户端。
 
 
 ## RTC 动作队列（2026-10-12）
