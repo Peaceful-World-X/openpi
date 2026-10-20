@@ -48,7 +48,11 @@ class Policy(BasePolicy):
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
         """
         self._model = model
-        self._input_transform = _transforms.compose(transforms)
+        # Keep the individual transforms around for policies that need to inject
+        # request-time data before robot-specific action conversion.  The
+        # composed transform remains the default path for ordinary policies.
+        self._input_transforms = tuple(transforms)
+        self._input_transform = _transforms.compose(self._input_transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
@@ -66,6 +70,21 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        return self._infer(obs, noise=noise, request_sample_kwargs={})
+
+    def _infer(
+        self,
+        obs: dict,
+        *,
+        noise: np.ndarray | None,
+        request_sample_kwargs: dict[str, Any],
+    ) -> dict:
+        """Run the shared transform, sampling, and output pipeline.
+
+        ``request_sample_kwargs`` is intentionally kept separate from
+        ``_sample_kwargs`` so an RTC request can provide a per-call action
+        prefix without mutating the policy shared by concurrent requests.
+        """
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -78,8 +97,16 @@ class Policy(BasePolicy):
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
+        request_sample_kwargs = jax.tree.map(
+            lambda x: jnp.asarray(x)[np.newaxis, ...]
+            if not self._is_pytorch_model
+            else torch.from_numpy(np.asarray(x)).to(self._pytorch_device)[None, ...],
+            request_sample_kwargs,
+        )
+
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        sample_kwargs.update(request_sample_kwargs)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
@@ -122,8 +149,11 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step = 0
 
     @override
-    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
-        results = self._policy.infer(obs)
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None, **kwargs) -> dict:  # type: ignore[misc]
+        if noise is None and not kwargs:
+            results = self._policy.infer(obs)
+        else:
+            results = self._policy.infer(obs, noise=noise, **kwargs)
 
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")

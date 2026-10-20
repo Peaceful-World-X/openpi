@@ -169,11 +169,11 @@ The command will log training progress to the console and save checkpoints to th
 在 AIStudio CPU 提交容器中，可先自动安装并检查提交 SDK（不申请 GPU）：
 
 ```bash
-cd /ossfs/workspace/openpi
+cd /ossfs/code/openpi
 bash ./submit.sh --check-only
 ```
 
-在 `/ossfs/workspace/openpi/.env` 中统一设置数据包、base 权重、输出路径、GPU 卡型/数量、训练配置、资源组和 OSS 信息。日常换数据或卡数只修改 `.env`，三个启动脚本无需修改。
+在项目根目录 `.env` 中统一设置数据包、base 权重、输出路径、GPU 卡型/数量、训练配置、资源组和 OSS 信息。日常换数据或卡数只修改 `.env`，三个启动脚本无需修改。
 
 提交前准备好 `.env` 指定的输入（默认路径）：
 
@@ -190,7 +190,7 @@ bash ./submit.sh --check-only
 数据包须包含 `meta/info.json`、`data/`、`assets/norm_stats.json` 及所需视频；支持外层一个数据集目录或平铺结构。base 的 `params` 和本地源码依赖须完整。
 
 ```bash
-cd /ossfs/workspace/openpi
+cd /ossfs/code/openpi
 # 当前已经有 GPU 的容器：自动初始化、训练、上传 OSS
 bash ./k8s_job.sh
 ```
@@ -198,7 +198,7 @@ bash ./k8s_job.sh
 需要申请新 GPU 作业时执行（缺少 pypai 会自动安装）：
 
 ```bash
-cd /ossfs/workspace/openpi
+cd /ossfs/code/openpi
 bash ./submit.sh
 ```
 
@@ -206,13 +206,21 @@ bash ./submit.sh
 `aii-pypai`、`couler-core`、`ant-couler`，验证后调用 `main.py`。提交 SDK 内部软件源
 `https://pypi.antfin-inc.com/simple/` 须可达；不会安装到 `/openpi-venv` 训练环境。
 
-提交默认读取 `.env` 的 `OPENPI_GPU_TYPE`、`OPENPI_GPU_NUM`、`OPENPI_TRAIN_CONFIG`、`OPENPI_RESOURCE_GROUP`。当前为 H20 ×2；实际申请 A100 时将卡型改为 `a100`。卡数必须与所选配置匹配。提交返回的 trace URL 可查看任务状态和日志。
+提交默认读取 `.env` 的 `OPENPI_GPU_TYPE`、`OPENPI_GPU_NUM`、`OPENPI_TRAIN_CONFIG`、`OPENPI_RESOURCE_GROUP`。当前云端配置为 `h20` ×8。使用原数据集进行 TTRTC 训练时，仅将 `.env` 的配置名改为以下值，其余配置保持原样：
+
+```ini
+OPENPI_TRAIN_CONFIG=pi05_bund_20260917_n906_v21_new_80G_8gpu_full_ttrtc
+```
+
+仍执行 `bash ./submit.sh`，无需额外参数或启动脚本。入口直接使用所选配置，保留 `.env` 中的 `h20` 卡型和8卡数量；TTRTC 配置与普通八卡配置使用相同 batch、学习率、训练步数、数据和权重。卡数不符会在申请 GPU 前报错。恢复普通配置名即可进行普通 Pi05 对照训练。TTRTC 实验保存到带 `_ttrtc` 的配置目录；续训需使用对应实验名。客户端 `deplay/client.yaml` 的开关只控制推理，不决定云端训练模型。提交返回的 trace URL 可查看任务状态和日志。
 
 三个脚本的分工：
 
 - `init_env.sh`：解压 Python 到 `/python`，在 `/openpi-venv` 安装和校验依赖、预置 tokenizer；缓存为 `/uv-cache`。apt 和 Python 内部软件源仍需可达。
 - `init_cfg.sh`：解压数据到 `OPENPI_DATA_DIR`，调用环境安装，将 NAS 上的 ossutil v1.7.18 自动复制到 `/ossutil64`，配置 OSS。单独执行只准备容器。
-- `k8s_job.sh`：调用初始化、按选定配置训练，每 300 秒上传已完成 checkpoint，退出时同步 checkpoint 和日志。默认自动生成实验名，不覆盖旧结果；续训追加日志。收到 `SIGTERM` 或 `Ctrl+C` 时停止训练工作进程并同步已完成的 checkpoint，保留中断退出码（强制 `SIGKILL` 无法执行收尾）。
+- `k8s_job.sh`：调用初始化、按选定配置训练，每 300 秒上传已完成 checkpoint。训练结束或报错退出后，先上传一个完整的 `train.log`，再完成最后的 checkpoint 同步。默认自动生成实验名，不覆盖旧结果；同一本地实验续训追加日志。收到 `SIGTERM` 或 `Ctrl+C` 时停止训练工作进程并同步已完成的 checkpoint，保留中断退出码（强制 `SIGKILL` 无法执行收尾）。
+
+`train.log` 保存训练进程完整的 stdout/stderr，包括 `Step ... loss=...`、TTRTC 真实动作指标和异常 traceback；loss 按原 `log_interval` 输出，不改变训练频率。文件本地位置为 `OPENPI_CHECKPOINT_DIR/<config>/<exp>.train.log`，训练退出后最终上传一次到 `OPENPI_OSS_ROOT/<project>/<exp>/train.log`（默认 `<project>` 为配置名），与各 step 的 checkpoint 目录同级。控制台会打印完整路径和 `Training log saved: ...`。最终日志强制覆盖同名 OSS 文件；checkpoint 上传失败不阻断日志保存，日志上传失败也会明确报错并返回非零状态。本次不增加 CSV/JSON 指标文件。
 
 `OPENPI_DATA_DIR` 是数据集最终目录：设为 `/data` 时，解压后直接得到 `/data/meta`、`/data/data` 和 `/data/assets`，不追加压缩包名称。新容器换数据只需修改 `OPENPI_DATA_ARCHIVE`；已有容器会复用通过检查的数据目录，换数据时需同时指定新的 `OPENPI_DATA_DIR`。`config.py` 同样读取 `.env`，直接执行 `scripts/train.py` 也会使用相同数据、norm、base 和输出路径。优先级：命令行参数 > 已导出的环境变量 > `.env` > 代码默认值；`.env` 使用普通 `KEY=VALUE`，路径写完整值。
 
@@ -220,11 +228,11 @@ bash ./submit.sh
 
 | 配置名后缀（共同前缀 `pi05_bund_20260917_n906_v21_new_`） | 卡数/FSDP | Global batch | 步数 | Warmup | Peak LR → End LR | Workers | 保存/保留间隔 |
 | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
-| `80G_8gpu_full` | 8 | 256 | 30,000 | 1,000 | 5e-5 → 5e-6 | 8 | 5,000 |
+| `80G_8gpu_full` / `80G_8gpu_full_ttrtc` | 8 | 256 | 50,000 | 1,000 | 5e-5 → 5e-6 | 8 | 5,000 |
 | `80G_4gpu_full` | 4 | 128 | 60,000 | 1,000 | 3.5e-5 → 3.5e-6 | 8 | 10,000 |
 | `80G_2gpu_full` | 2 | 64 | 120,000 | 1,000 | 2.5e-5 → 2.5e-6 | 8 | 20,000 |
 
-三套均为 pi05 base 全参数微调，使用 BF16、AdamW、EMA=0.99、cosine 学习率和 50 步 chunk。动作 0:9 为相对 chunk 起点 EEF 的位姿，9 为绝对夹爪，norm 默认读取数据目录的 `assets/norm_stats.json`。三套各采样 768 万个 chunk，样本量相同不保证训练效果相同。`keep_period=save_interval` 保留每次定期保存；最终目录分别为 `29999`、`59999`、`119999`。
+三套均为 pi05 base 全参数微调，使用 BF16、AdamW、EMA=0.99、cosine 学习率和 50 步 chunk。动作 0:9 为相对 chunk 起点 EEF 的位姿，9 为绝对夹爪，norm 默认读取数据目录的 `assets/norm_stats.json`。八卡采样 1280 万个 chunk，四卡和两卡各采样 768 万个；这些数值沿用 TTRTC 修改前的代码配置。`keep_period=save_interval` 保留每次定期保存；最终目录分别为 `49999`、`59999`、`119999`。
 
 结果默认写入 `/result/<config>/<exp>/`，上传至 `OPENPI_OSS_ROOT/<config>/<exp>/`。需要续训时同时设置 `OPENPI_EXP_NAME=<已有实验名>` 和 `OPENPI_RESUME=1`，并保留该实验的本地 checkpoint；不会自动从 OSS 下载 checkpoint。
 

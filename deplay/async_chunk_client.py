@@ -1,10 +1,12 @@
-"""Action queue with two scheduling parameters: reinfer and blend.
+"""Action queue with TTRTC delay conditioning and trajectory scheduling.
 
-RTC requests a new chunk when `reinfer` actions remain. A completed response
-replaces the queue at the next control step; actions already consumed since
-its observation are skipped. The first `blend` remaining actions are then
-blended with the time-aligned old plan. This is client-side trajectory blending,
-not a modification of the model's denoising/inference algorithm.
+RTC requests a new chunk when `reinfer` actions remain. Each request carries a
+copy of the complete unconsumed action suffix and the estimated number of
+control steps before the response is expected. A completed response replaces
+the queue at the next control step; actions already consumed since its
+observation are skipped. The first `blend` remaining actions are then blended
+with the time-aligned old plan. This is client-side trajectory blending, not a
+modification of the model's denoising/inference algorithm.
 
 Without RTC, each synchronous request supplies exactly `reinfer` actions.
 """
@@ -26,14 +28,22 @@ from .ur7.se3 import interpolate_absolute_action
 logger = logging.getLogger(__name__)
 
 
-def validate_rtc_config(reinfer: int, blend: int, inference_delay_steps: int = 4) -> None:
+def validate_rtc_config(
+    reinfer: int,
+    blend: int,
+    inference_delay_steps: int = 4,
+    max_delay_steps: int = 10,
+) -> None:
     if isinstance(reinfer, bool) or not isinstance(reinfer, int) or reinfer <= 0:
         raise ValueError("rtc.reinfer must be a positive integer")
     if isinstance(blend, bool) or not isinstance(blend, int) or not 0 <= blend <= reinfer:
         raise ValueError("rtc.blend must be an integer in [0, reinfer]")
     if (isinstance(inference_delay_steps, bool) or not isinstance(inference_delay_steps, int)
             or inference_delay_steps < 0):
-        raise ValueError("rtc.inference_delay_steps must be a non-negative integer")
+        raise ValueError("inference_delay_steps must be a non-negative integer")
+    if (isinstance(max_delay_steps, bool) or not isinstance(max_delay_steps, int)
+            or max_delay_steps < 0):
+        raise ValueError("max_delay_steps must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -51,17 +61,24 @@ class ChunkStepInfo:
 
 class AsyncChunkClient:
     def __init__(self, policy: Any, *, rtc_enabled: bool = True,
+                 ttrtc_enabled: bool = False,
                  reinfer: int = 30, blend: int = 16, inference_delay_steps: int = 4,
-                 control_period_s: float = 0.1):
-        validate_rtc_config(reinfer, blend, inference_delay_steps)
+                 max_delay_steps: int = 10, control_period_s: float = 0.1):
+        validate_rtc_config(reinfer, blend, inference_delay_steps, max_delay_steps)
         if not math.isfinite(control_period_s) or control_period_s <= 0:
             raise ValueError("control_period_s must be positive and finite")
         self._policy = policy
         self._rtc_enabled = bool(rtc_enabled)
+        # ``rtc_enabled`` controls asynchronous queue scheduling.  Only this
+        # separate flag enables the TTRTC wire context and prefix conditioning.
+        self._ttrtc_enabled = bool(ttrtc_enabled)
+        if self._ttrtc_enabled and not self._rtc_enabled:
+            raise ValueError("ttrtc_enabled requires rtc_enabled scheduling")
         self._reinfer = reinfer
         self._blend = blend
         self._control_period_s = control_period_s
-        self._inference_delay_steps = inference_delay_steps
+        self._max_delay_steps = max_delay_steps
+        self._inference_delay_steps = min(inference_delay_steps, max_delay_steps)
         self._latencies = deque(maxlen=10)
         self._pending_switch_steps = 0
         self._lock = threading.RLock()
@@ -90,12 +107,21 @@ class AsyncChunkClient:
     def inference_delay_steps(self) -> int:
         return self._inference_delay_steps
 
+    @property
+    def max_delay_steps(self) -> int:
+        return self._max_delay_steps
+
+    @property
+    def ttrtc_enabled(self) -> bool:
+        return self._ttrtc_enabled
+
     def _record_latency(self, seconds: float) -> None:
         self._latencies.append(seconds)
         if len(self._latencies) == 10:
             mean = sum(self._latencies) / 10
             previous = self._inference_delay_steps
-            self._inference_delay_steps = max(0, math.ceil(mean / self._control_period_s))
+            estimated = max(0, math.ceil(mean / self._control_period_s))
+            self._inference_delay_steps = min(self._max_delay_steps, estimated)
             logger.info("RTC delay: samples=10 mean_ms=%.1f estimated_steps=%d previous=%d",
                         mean * 1000, self._inference_delay_steps, previous)
             if self._inference_delay_steps >= self._reinfer:
@@ -111,7 +137,7 @@ class AsyncChunkClient:
     def needs_prefetch(self) -> bool:
         with self._lock:
             return (self._rtc_enabled and self._current is not None
-                    and self._future is None and self.queue_remaining <= self._reinfer)
+                    and self._future is None and 0 < self.queue_remaining <= self._reinfer)
 
     @property
     def last_step_info(self):
@@ -129,10 +155,19 @@ class AsyncChunkClient:
     def rtc_merge_count(self) -> int:
         return self._rtc_merge_count
 
-    def _fetch(self, observation: Mapping[str, Any], generation: int) -> np.ndarray:
+    def _fetch(
+        self,
+        observation: Mapping[str, Any],
+        generation: int,
+        rtc_context: Mapping[str, Any] | None = None,
+    ) -> np.ndarray:
         if generation != self._generation:
             raise RuntimeError("stale action-chunk request")
-        chunk = np.array(self._policy.infer_chunk(observation), dtype=np.float64, copy=True)
+        if rtc_context is None:
+            chunk = self._policy.infer_chunk(observation)
+        else:
+            chunk = self._policy.infer_chunk(observation, rtc_context=rtc_context)
+        chunk = np.array(chunk, dtype=np.float64, copy=True)
         if chunk.ndim != 2 or chunk.shape[1:] != (10,) or not np.isfinite(chunk).all():
             raise ValueError(f"server actions must be finite (N, 10), got {chunk.shape}")
         minimum = self._reinfer + int(self._rtc_enabled)
@@ -141,8 +176,14 @@ class AsyncChunkClient:
                              f"requires at least {minimum} with RTC={self._rtc_enabled}")
         return chunk
 
-    def _fetch_timed(self, observation: Mapping[str, Any], generation: int, started: float):
-        chunk = self._fetch(observation, generation)
+    def _fetch_timed(
+        self,
+        observation: Mapping[str, Any],
+        generation: int,
+        started: float,
+        rtc_context: Mapping[str, Any] | None = None,
+    ):
+        chunk = self._fetch(observation, generation, rtc_context)
         # Timestamp completion here, not when the control thread consumes it.
         elapsed = time.monotonic() - started
         self._log_inference_latency(elapsed, "RTC异步")
@@ -171,8 +212,9 @@ class AsyncChunkClient:
             chunk = self._fetch(observation, self._generation)
             self._log_inference_latency(time.monotonic() - started, "首次同步")
             self._install(chunk if self._rtc_enabled else chunk[:self._reinfer])
-            logger.info("scheduler initialized: rtc=%s reinfer=%d blend=%d delay=%d received=%d queued=%d",
-                        self._rtc_enabled, self._reinfer, self._blend, self._inference_delay_steps,
+            logger.info("scheduler initialized: rtc=%s ttrtc=%s reinfer=%d blend=%d delay=%d received=%d queued=%d",
+                        self._rtc_enabled, self._ttrtc_enabled, self._reinfer, self._blend,
+                        self._inference_delay_steps,
                         len(chunk), len(self._current))
             return chunk.copy()
 
@@ -184,9 +226,28 @@ class AsyncChunkClient:
                 return False
             self._pending_cursor = self._cursor
             self._pending_started_s = time.monotonic()
-            self._pending_switch_steps = min(self._inference_delay_steps, self.queue_remaining)
-            self._future = self._executor.submit(self._fetch_timed, dict(observation),
-                                                self._generation, self._pending_started_s)
+            # Snapshot the complete unconsumed plan at the same cursor as the
+            # observation.  The worker must never read the mutable queue later,
+            # because the control thread advances it while inference runs.
+            remaining = np.array(self._current[self._cursor:], dtype=np.float64, copy=True)
+            self._pending_switch_steps = min(
+                self._inference_delay_steps,
+                self._max_delay_steps,
+                len(remaining),
+            )
+            rtc_context = None
+            if self._ttrtc_enabled:
+                rtc_context = {
+                    "inference_delay": self._pending_switch_steps,
+                    "prev_chunk_left_over": remaining,
+                }
+            self._future = self._executor.submit(
+                self._fetch_timed,
+                dict(observation),
+                self._generation,
+                self._pending_started_s,
+                rtc_context,
+            )
             self._prefetch_started_count += 1
             return True
 

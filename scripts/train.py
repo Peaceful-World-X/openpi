@@ -133,6 +133,15 @@ def init_train_state(
     return train_state, state_sharding
 
 
+def _compute_real_action_metrics(raw_loss, postfix_mask, real_action_dim):
+    """按样本后缀平均真实动作维度，屏蔽模型补零维度。"""
+    postfix_mask = postfix_mask.astype(raw_loss.dtype)
+    postfix_count = jnp.maximum(jnp.sum(postfix_mask, axis=-1), 1.0)
+    per_sample_loss = jnp.sum(raw_loss * postfix_mask[..., None], axis=1) / postfix_count[:, None]
+    real_loss = per_sample_loss[:, :real_action_dim]
+    return jnp.mean(real_loss), jnp.mean(real_loss, axis=0), jnp.mean(postfix_mask)
+
+
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
@@ -147,15 +156,35 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        # Only configurations that request physical-action metrics need the
+        # auxiliary tensors.  This keeps unrelated standard runs on the
+        # original scalar-loss path while TTRTC gets one shared forward pass.
+        if getattr(config, "real_action_dim", None) is None:
+            return jnp.mean(model.compute_loss(rng, observation, actions, train=True)), None
+
+        # TTRTC models expose the raw per-action loss and postfix mask from the
+        # same forward pass.  Keep the fallback for other models so this entry
+        # point remains compatible with every BaseModel.
+        compute_loss_details = getattr(model, "compute_loss_details", None)
+        # ``compute_loss_with_details`` was used by the first RTC prototype;
+        # accept it as an alias while new models migrate to the shorter name.
+        if compute_loss_details is None:
+            compute_loss_details = getattr(model, "compute_loss_with_details", None)
+        if compute_loss_details is None:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            return jnp.mean(chunked_loss), None
+
+        chunked_loss, details = compute_loss_details(rng, observation, actions, train=True)
+        return jnp.mean(chunked_loss), details
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, loss_details), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -188,6 +217,33 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+
+    # ``raw_loss`` is [batch, action_horizon, action_dim].  The postfix mask
+    # selects the actions that were actually predicted for each TTRTC sample;
+    # reduce over that mask per sample before taking the batch mean so samples
+    # with different delays contribute equally.  These metrics are auxiliary
+    # diagnostics only: the optimized loss above remains the model's official
+    # loss reduction.
+    if loss_details is not None:
+        raw_loss = loss_details.get("raw_loss", loss_details.get("raw_mse"))
+        if raw_loss is None:
+            raise KeyError("loss details must contain 'raw_loss'")
+        delay = loss_details["delay"]
+        configured_real_action_dim = getattr(config, "real_action_dim", None)
+        real_action_dim = (
+            0
+            if configured_real_action_dim is None
+            else min(int(configured_real_action_dim), raw_loss.shape[-1])
+        )
+        if real_action_dim > 0:
+            loss_real_action, loss_real_action_dims, postfix_fraction = _compute_real_action_metrics(
+                raw_loss, loss_details["postfix_mask"], real_action_dim
+            )
+            info["loss_real_action"] = loss_real_action
+            for dim_idx in range(real_action_dim):
+                info[f"loss_real_action_dim_{dim_idx:02d}"] = loss_real_action_dims[dim_idx]
+            info["ttrtc_delay_mean"] = jnp.mean(delay)
+            info["ttrtc_postfix_fraction"] = postfix_fraction
     return new_state, info
 
 

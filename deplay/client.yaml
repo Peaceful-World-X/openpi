@@ -16,10 +16,14 @@ control:
   action_space: absolute
 
 rtc:
-  enabled: true
+  enabled: false
   reinfer: 30               # RTC: 执行多少步数后请求；关闭 RTC: 每次同步取此步数
   blend: 16                 # 删除已过去动作后，从剩余新动作开头融合的步数
-  inference_delay_steps: 3  # 初始估计；满 10 次后按最近 10 次平均耗时自动更新
+
+ttrtc:
+  enabled: true
+  inference_delay_steps: 3  # 初始估计；按最近 10 次真实耗时自动更新
+  max_delay_steps: 10       # Pi0RTC 训练边界，发送 delay 限制在 [0, 10]
 
 replay:
   action_column: action

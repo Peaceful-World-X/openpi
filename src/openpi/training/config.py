@@ -18,6 +18,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_rtc_config as pi0_rtc_config
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -528,6 +529,11 @@ class TrainConfig:
     # define additional attributes.
     model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
 
+    # Number of action dimensions corresponding to the physical robot action.
+    # Models may pad actions to a larger dimension; this value is used by
+    # auxiliary metrics and must not exceed ``model.action_dim``.
+    real_action_dim: int | None = None
+
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
@@ -606,6 +612,18 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if (
+            self.real_action_dim is not None
+            and (
+                isinstance(self.real_action_dim, bool)
+                or not isinstance(self.real_action_dim, int)
+                or not 1 <= self.real_action_dim <= self.model.action_dim
+            )
+        ):
+            raise ValueError(
+                "real_action_dim must satisfy 1 <= real_action_dim <= model.action_dim; "
+                f"got real_action_dim={self.real_action_dim}, model.action_dim={self.model.action_dim}."
+            )
 
 
 # Shared full-fine-tuning definition for the fixed UR7 dataset.  Each public
@@ -623,6 +641,8 @@ def _ur7_h20_config(
     save_interval: int,
     log_interval: int = 100,
     wandb_enabled: bool = True,
+    ttrtc: bool = False,
+    max_delay: int = 10,
 ) -> TrainConfig:
     # Read paths for direct train.py runs too; explicit environment/CLI values
     # take precedence. Keep hyperparameters in the three presets below.
@@ -641,15 +661,27 @@ def _ur7_h20_config(
     dataset_dir = settings.get("OPENPI_DATA_DIR") or "/data"
     assets_dir = settings.get("OPENPI_ASSETS_DIR") or dataset_dir
 
-    return TrainConfig(
-        name=name,
-        project_name="openpi_ur7",
-        model=pi0_config.Pi0Config(
+    if ttrtc:
+        model = pi0_rtc_config.Pi0RTCConfig(
             pi05=True,
             dtype="bfloat16",
             action_dim=32,
             action_horizon=50,
-        ),
+            max_delay=max_delay,
+        )
+    else:
+        model = pi0_config.Pi0Config(
+            pi05=True,
+            dtype="bfloat16",
+            action_dim=32,
+            action_horizon=50,
+        )
+
+    return TrainConfig(
+        name=name,
+        project_name="openpi_ur7",
+        model=model,
+        real_action_dim=10 if ttrtc else None,
         data=LeRobotUR7DataConfig(
             repo_id=dataset_dir,
             relative_action_dims=(0, 1, 2, 3, 4, 5, 6, 7, 8),
@@ -1104,6 +1136,22 @@ _CONFIGS = [
         num_workers=8,
         save_interval=5_000,
     ),
+    # H20-3E x8 Training-Time RTC run. Keep the global batch and sampled-chunk
+    # budget aligned with the non-RTC x8 baseline so that only the training
+    # objective changes between the two runs.
+    _ur7_h20_config(
+        name="pi05_bund_20260917_n906_v21_new_80G_8gpu_full_ttrtc",
+        fsdp_devices=8,
+        batch_size=256,
+        num_train_steps=50_000,
+        warmup_steps=1_000,
+        peak_lr=5e-5,
+        decay_lr=5e-6,
+        num_workers=8,
+        save_interval=5_000,
+        ttrtc=True,
+        max_delay=10,
+    ),
     # H20-3E x4: same sample budget as x8, with sqrt-scaled LR.
     _ur7_h20_config(
         name="pi05_bund_20260917_n906_v21_new_80G_4gpu_full",
@@ -1115,6 +1163,20 @@ _CONFIGS = [
         decay_lr=3.5e-6,
         num_workers=8,
         save_interval=10_000,
+    ),
+    # H20-3E x4 Training-Time RTC run, using the same budget as the baseline x4 config.
+    _ur7_h20_config(
+        name="pi05_bund_20260917_n906_v21_new_80G_4gpu_full_ttrtc",
+        fsdp_devices=4,
+        batch_size=128,
+        num_train_steps=60_000,
+        warmup_steps=1_000,
+        peak_lr=3.5e-5,
+        decay_lr=3.5e-6,
+        num_workers=8,
+        save_interval=10_000,
+        ttrtc=True,
+        max_delay=10,
     ),
     # H20-3E x2: full fine-tuning run, same 7.68M sampled-chunk budget as x8/x4.
     _ur7_h20_config(

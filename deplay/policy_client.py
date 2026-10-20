@@ -131,11 +131,29 @@ class WebSocketPolicyClient:
                 old.close()
         self._connect()
 
-    def infer(self, observation: Mapping[str, Any]) -> dict[str, Any]:
-        """Send one observation and return the server's decoded action dict."""
+    def infer(
+        self,
+        observation: Mapping[str, Any],
+        *,
+        rtc_context: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Send one observation and return the server's decoded action dict.
+
+        RTC requests use a nested envelope so the server can distinguish the
+        execution-space action prefix from ordinary observation fields.  Keep
+        the historical flat observation payload when no context is supplied.
+        """
         if not isinstance(observation, Mapping):
             raise TypeError("observation must be a mapping")
-        payload = self._packer.pack(dict(observation))
+        if rtc_context is not None and not isinstance(rtc_context, Mapping):
+            raise TypeError("rtc_context must be a mapping")
+        observation_payload = dict(observation)
+        context_payload = None if rtc_context is None else dict(rtc_context)
+        request = observation_payload if context_payload is None else {
+            "observation": observation_payload,
+            "rtc_context": context_payload,
+        }
+        payload = self._packer.pack(request)
         with self._lock:
             if self._closed:
                 raise RuntimeError("policy client is closed")
@@ -150,8 +168,10 @@ class WebSocketPolicyClient:
                     "attempt": attempt,
                     "started_monotonic_s": started_s,
                     "uri": self._uri,
-                    "observation": dict(observation),
+                    "observation": observation_payload,
                 }
+                if context_payload is not None:
+                    debug_event["rtc_context"] = context_payload
                 try:
                     if self._ws is None:
                         self._connect()
@@ -203,9 +223,15 @@ class WebSocketPolicyClient:
         except Exception:
             logger.warning("failed to write policy debug event", exc_info=True)
 
-    def infer_chunk(self, observation: Mapping[str, Any], *, action_dim: int = 10) -> np.ndarray:
+    def infer_chunk(
+        self,
+        observation: Mapping[str, Any],
+        *,
+        action_dim: int = 10,
+        rtc_context: Mapping[str, Any] | None = None,
+    ) -> np.ndarray:
         """Infer and strictly validate an absolute canonical action chunk."""
-        result = self.infer(observation)
+        result = self.infer(observation, rtc_context=rtc_context)
         if "actions" not in result:
             raise ValueError("policy response has no 'actions' field")
         actions = np.asarray(result["actions"], dtype=np.float64)

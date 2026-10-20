@@ -126,7 +126,21 @@ class RMSNorm(nn.Module):
 
         # adaptive RMSNorm
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
-        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
+        # A batch condition (B, E) is shared by every token.  RTC supplies a
+        # condition for every action token (B, T, E), which must stay aligned
+        # with the token sequence instead of being broadcast through a new
+        # singleton axis.  Validate both leading dimensions so an accidental
+        # broadcast cannot silently train the wrong action positions.
+        if cond.ndim == 2:
+            if cond.shape[0] != x.shape[0]:
+                raise ValueError(f"Expected cond batch dimension {x.shape[0]}, got {cond.shape[0]}")
+            modulation = modulation[:, None, :]
+        elif cond.ndim == 3:
+            if cond.shape[:2] != x.shape[:2]:
+                raise ValueError(f"Expected cond leading dimensions {x.shape[:2]}, got {cond.shape[:2]}")
+        else:
+            raise ValueError(f"Expected cond rank 2 or 3, got rank {cond.ndim}")
+        scale, shift, gate = jnp.split(modulation, 3, axis=-1)
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
 
@@ -392,7 +406,7 @@ class Module(nn.Module):
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
-        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        adarms_cond: Sequence[at.Float[at.Array, "..."] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,

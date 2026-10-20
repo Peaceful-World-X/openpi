@@ -46,20 +46,29 @@ def make_attn_mask(input_mask, mask_ar):
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
-) -> at.Float[at.Array, "b {embedding_dim}"]:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    pos: at.Real[at.Array, "*shape"], embedding_dim: int, min_period: float, max_period: float
+) -> at.Float[at.Array, "*shape {embedding_dim}"]:
+    """Compute sine-cosine embeddings for batch or per-action positions.
+
+    The regular Pi0 path passes one timestep per batch item (``[B]``), while
+    training-time RTC passes one timestep per action token (``[B, H]``).  Keep
+    the rank-1 einsum path identical to the original implementation and use a
+    trailing frequency axis for token-wise positions.
+    """
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
 
     fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
     period = min_period * (max_period / min_period) ** fraction
-    sinusoid_input = jnp.einsum(
-        "i,j->ij",
-        pos,
-        1.0 / period * 2 * jnp.pi,
-        precision=jax.lax.Precision.HIGHEST,
-    )
+    if pos.ndim == 1:
+        sinusoid_input = jnp.einsum(
+            "i,j->ij",
+            pos,
+            1.0 / period * 2 * jnp.pi,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+    else:
+        sinusoid_input = pos[..., None] * (1.0 / period * 2 * jnp.pi)
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
@@ -138,12 +147,15 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"] | at.Float[at.Array, "b ah"],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | at.Float[at.Array, "b ah emb"] | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -157,6 +169,20 @@ class Pi0(_model.BaseModel):
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
+        # Validate the time shape explicitly: token-wise time must line up with
+        # each action token, otherwise JAX would silently broadcast the wrong
+        # condition across the action horizon.
+        if timestep.ndim == 1:
+            if timestep.shape[0] != noisy_actions.shape[0]:
+                raise ValueError(
+                    f"Expected timestep batch dimension {noisy_actions.shape[0]}, got {timestep.shape[0]}"
+                )
+        elif timestep.ndim == 2:
+            if timestep.shape != noisy_actions.shape[:2]:
+                raise ValueError(f"Expected timestep shape {noisy_actions.shape[:2]}, got {timestep.shape}")
+        else:
+            raise ValueError(f"Expected timestep rank 1 or 2, got {timestep.ndim}")
+
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         if self.pi05:
@@ -169,7 +195,11 @@ class Pi0(_model.BaseModel):
             adarms_cond = time_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            time_tokens = (
+                einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+                if time_emb.ndim == 2
+                else time_emb
+            )
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
@@ -185,23 +215,16 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
-    @override
-    def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+    def _compute_loss_from_inputs(self, observation, x_t, u_t, model_time):
+        """Run the shared transformer forward and return per-dimension MSE.
 
-        batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        # one big forward pass of prefix + suffix at once
+        Keeping the final action dimension here allows the training loop to
+        report metrics for the physical action dimensions without a second
+        transformer invocation.  ``compute_loss`` reduces this tensor over the
+        action dimension to preserve the official ``[B, H]`` API.
+        """
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, model_time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -210,8 +233,43 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        return jnp.square(v_t - u_t)
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+    def _compute_loss_details(self, rng, observation, actions, *, train=False):
+        """Return official loss plus raw MSE and bookkeeping tensors."""
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        batch_shape = actions.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        raw_mse = self._compute_loss_from_inputs(observation, x_t, noise - actions, time)
+        return jnp.mean(raw_mse, axis=-1), {
+            "raw_loss": raw_mse,
+            "postfix_mask": jnp.ones(raw_mse.shape[:-1], dtype=jnp.bool_),
+            "delay": jnp.zeros(batch_shape, dtype=jnp.int32),
+        }
+
+    @at.typecheck
+    @override
+    def compute_loss(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, "*b ah"]:
+        loss, details = self._compute_loss_details(rng, observation, actions, train=train)
+        del details
+        return loss
+
+    def compute_loss_details(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ):
+        """Compute loss and raw-MSE diagnostics in one forward pass."""
+        return self._compute_loss_details(rng, observation, actions, train=train)
 
     @override
     def sample_actions(

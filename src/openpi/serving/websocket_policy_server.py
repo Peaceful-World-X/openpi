@@ -1,9 +1,11 @@
 import asyncio
+from collections.abc import Mapping
 import http
 import logging
 import time
 import traceback
 
+import numpy as np
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
@@ -55,10 +57,18 @@ class WebsocketPolicyServer:
         while True:
             try:
                 start_time = time.perf_counter()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                request = msgpack_numpy.unpackb(await websocket.recv())
+                obs, rtc_context = _decode_request(request)
 
                 infer_start = time.perf_counter()
-                action = self._policy.infer(obs)
+                if rtc_context is None:
+                    action = self._policy.infer(obs)
+                else:
+                    action = self._policy.infer(
+                        obs,
+                        inference_delay=rtc_context["inference_delay"],
+                        prev_chunk_left_over=rtc_context["prev_chunk_left_over"],
+                    )
                 infer_ms = (time.perf_counter() - infer_start) * 1000
 
                 client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
@@ -88,6 +98,45 @@ class WebsocketPolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
+
+
+def _decode_request(request: object) -> tuple[dict, dict | None]:
+    """Decode the flat legacy or nested stateless RTC request format."""
+    if not isinstance(request, Mapping):
+        raise ValueError(f"policy request must be a mapping, got {type(request).__name__}")
+
+    has_context = "rtc_context" in request
+    has_observation = "observation" in request
+    if not has_context:
+        # Preserve the original protocol for arbitrary flat observation
+        # dictionaries, including one that happens to use an ``observation``
+        # key for its own data contract.  The nested RTC envelope is selected
+        # only when its context field is present as well.
+        return dict(request), None
+
+    if not has_observation:
+        raise ValueError("RTC request must include an observation mapping")
+    observation = request["observation"]
+    context = request["rtc_context"]
+    if not isinstance(observation, Mapping):
+        raise ValueError("request.observation must be a mapping")
+    if not isinstance(context, Mapping):
+        raise ValueError("request.rtc_context must be a mapping")
+    required = ("inference_delay", "prev_chunk_left_over")
+    missing = [key for key in required if key not in context]
+    if missing:
+        raise ValueError(f"request.rtc_context missing required fields: {', '.join(missing)}")
+
+    delay = np.asarray(context["inference_delay"])
+    if delay.size != 1 or not np.issubdtype(delay.dtype, np.integer):
+        raise ValueError("rtc_context.inference_delay must be a scalar integer")
+    prefix = np.asarray(context["prev_chunk_left_over"])
+    if prefix.ndim != 2:
+        raise ValueError("rtc_context.prev_chunk_left_over must be a 2D action sequence")
+    return dict(observation), {
+        "inference_delay": int(delay.item()),
+        "prev_chunk_left_over": prefix,
+    }
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:

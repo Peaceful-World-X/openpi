@@ -73,7 +73,9 @@ class UR7DeploymentClient:
         reinfer: int = 30,
         blend: int = 16,
         inference_delay_steps: int = 4,
+        max_delay_steps: int = 10,
         rtc_enabled: bool = True,
+        ttrtc_enabled: bool = False,
         action_space: str = "absolute",
         safety: SafetyLimits | None = None,
         image_size: int = 224,
@@ -98,8 +100,10 @@ class UR7DeploymentClient:
             reinfer=reinfer,
             blend=blend,
             inference_delay_steps=inference_delay_steps,
+            max_delay_steps=max_delay_steps,
             control_period_s=self.period_s,
             rtc_enabled=rtc_enabled,
+            ttrtc_enabled=ttrtc_enabled,
         )
         self._debug_callback = debug_callback
         self._debug_step_id = 0
@@ -623,6 +627,8 @@ def main() -> None:
                         help="number of new actions blended after removing elapsed actions")
     parser.add_argument("--inference-delay-steps", type=int, default=None,
                         help="initial delay; adapts from the mean of the last 10 async requests")
+    parser.add_argument("--max-delay-steps", type=int, default=None,
+                        help="maximum delay sent to TTRTC (defaults to the model training bound)")
     parser.add_argument("--action-space", choices=("absolute", "relative_se3"), default=None)
     parser.add_argument("--robot-ip", default=None)
     parser.add_argument("--gripper-connection", default=None)
@@ -632,6 +638,8 @@ def main() -> None:
     parser.add_argument("--confirm")
     parser.add_argument("--rtc", dest="rtc_enabled", action="store_true", help="enable time-aligned RTC fusion")
     parser.add_argument("--no-rtc", dest="rtc_enabled", action="store_false", help="synchronous inference, execute reinfer actions per request")
+    parser.add_argument("--ttrtc", dest="ttrtc_enabled", action="store_true", help="enable TTRTC prefix-conditioned inference")
+    parser.add_argument("--no-ttrtc", dest="ttrtc_enabled", action="store_false", help="disable TTRTC prefix-conditioned inference")
     parser.add_argument("--smoke", action="store_true", help="Use a fake robot and black images")
     parser.add_argument(
         "--debug",
@@ -645,7 +653,7 @@ def main() -> None:
     )
     parser.add_argument("--interactive", dest="interactive", action="store_true", help="Enable keyboard state machine")
     parser.add_argument("--non-interactive", dest="interactive", action="store_false", help="Run a fixed number of steps")
-    parser.set_defaults(interactive=None, rtc_enabled=None)
+    parser.set_defaults(interactive=None, rtc_enabled=None, ttrtc_enabled=None)
     args = parser.parse_args()
     if args.steps is not None and args.steps < 0:
         parser.error("--steps must be non-negative")
@@ -654,26 +662,61 @@ def main() -> None:
     task = args.task or _cfg(config, "task", default="")
     control_hz = args.control_hz or _cfg(config, "control", "control_hz", default=10.0)
     rtc_config = config.get("rtc", {})
+    ttrtc_config = config.get("ttrtc", {})
     if not isinstance(rtc_config, Mapping):
-        parser.error("rtc must contain enabled, reinfer, blend and inference_delay_steps")
-    unknown = set(rtc_config) - {"enabled", "reinfer", "blend", "inference_delay_steps"}
-    if unknown:
-        parser.error(f"obsolete/unknown rtc keys: {sorted(unknown)}; use enabled, reinfer, blend, inference_delay_steps")
-    reinfer = args.reinfer if args.reinfer is not None else rtc_config.get("reinfer", 30)
-    blend = args.blend if args.blend is not None else rtc_config.get("blend", 16)
-    inference_delay_steps = (args.inference_delay_steps if args.inference_delay_steps is not None
-                             else rtc_config.get("inference_delay_steps", 4))
-    try:
-        validate_rtc_config(reinfer, blend, inference_delay_steps)
-    except ValueError as error:
-        parser.error(str(error))
-    if "enabled" in rtc_config and not isinstance(rtc_config["enabled"], bool):
-        parser.error("rtc.enabled must be a YAML boolean")
+        parser.error("rtc must be a mapping")
+    if not isinstance(ttrtc_config, Mapping):
+        parser.error("ttrtc must be a mapping")
+    rtc_unknown = set(rtc_config) - {"enabled", "reinfer", "blend"}
+    if rtc_unknown:
+        parser.error(f"unknown rtc keys: {sorted(rtc_unknown)}; use enabled, reinfer, blend")
+    ttrtc_unknown = set(ttrtc_config) - {"enabled", "inference_delay_steps", "max_delay_steps"}
+    if ttrtc_unknown:
+        parser.error(
+            f"unknown ttrtc keys: {sorted(ttrtc_unknown)}; use enabled, "
+            "inference_delay_steps, max_delay_steps"
+        )
+    for section_name, section in (("rtc", rtc_config), ("ttrtc", ttrtc_config)):
+        if "enabled" in section and not isinstance(section["enabled"], bool):
+            parser.error(f"{section_name}.enabled must be a YAML boolean")
+
     rtc_enabled = (
-        bool(_cfg(config, "rtc", "enabled", default=False))
+        bool(rtc_config.get("enabled", False))
         if args.rtc_enabled is None
         else bool(args.rtc_enabled)
     )
+    ttrtc_enabled = (
+        bool(ttrtc_config.get("enabled", False))
+        if args.ttrtc_enabled is None
+        else bool(args.ttrtc_enabled)
+    )
+    if rtc_enabled and ttrtc_enabled:
+        parser.error("rtc.enabled and ttrtc.enabled cannot both be true")
+
+    # Both modes share one asynchronous queue scheduler.  TTRTC deliberately
+    # defaults to no blend so the model-generated postfix is preserved.  The
+    # CLI override remains available for deployments that deliberately want
+    # client-side trajectory fusion; legacy RTC keeps its YAML blend setting.
+    reinfer = args.reinfer if args.reinfer is not None else rtc_config.get("reinfer", 30)
+    if ttrtc_enabled:
+        blend = args.blend if args.blend is not None else 0
+        inference_delay_steps = (
+            args.inference_delay_steps if args.inference_delay_steps is not None
+            else ttrtc_config.get("inference_delay_steps", 3)
+        )
+        max_delay_steps = (
+            args.max_delay_steps if args.max_delay_steps is not None
+            else ttrtc_config.get("max_delay_steps", 10)
+        )
+    else:
+        blend = args.blend if args.blend is not None else rtc_config.get("blend", 16)
+        inference_delay_steps = args.inference_delay_steps if args.inference_delay_steps is not None else 4
+        max_delay_steps = args.max_delay_steps if args.max_delay_steps is not None else 10
+    try:
+        validate_rtc_config(reinfer, blend, inference_delay_steps, max_delay_steps)
+    except ValueError as error:
+        parser.error(str(error))
+    scheduler_enabled = rtc_enabled or ttrtc_enabled
     action_space = args.action_space or _cfg(config, "control", "action_space", default="absolute")
     robot_ip = args.robot_ip or _cfg(config, "robot", "ip", default="192.168.1.188")
     gripper_connection = args.gripper_connection or _cfg(config, "robot", "gripper_connection", default=None)
@@ -703,8 +746,10 @@ def main() -> None:
         debug_recorder = _SessionDebugRecorder(debug_path, metadata={
             "config": config, "server": server, "action_space": action_space,
             "control_hz": control_hz, "rtc_enabled": rtc_enabled,
+            "ttrtc_enabled": ttrtc_enabled,
             "reinfer": reinfer, "blend": blend, "execute": args.execute,
             "initial_inference_delay_steps": inference_delay_steps,
+            "max_delay_steps": max_delay_steps,
         })
         debug_callback = debug_recorder
         debug_close = debug_recorder.close
@@ -729,6 +774,36 @@ def main() -> None:
     except BaseException:
         debug_close()
         raise
+    effective_max_delay_steps = max_delay_steps
+    if ttrtc_enabled:
+        if policy.server_metadata.get("rtc_enabled") is not True:
+            policy.close()
+            debug_close()
+            parser.error("TTRTC requires a policy server advertising rtc_enabled=true")
+        # A TTRTC server advertises the bound used during training.  Respect a
+        # stricter server bound while retaining the YAML value as the fallback
+        # for older servers that do not expose the numeric metadata.
+        server_max_delay = policy.server_metadata.get("rtc_max_delay")
+        if server_max_delay is not None:
+            if isinstance(server_max_delay, bool) or not isinstance(server_max_delay, int) or server_max_delay < 0:
+                policy.close()
+                debug_close()
+                parser.error("policy server metadata rtc_max_delay must be a non-negative integer")
+            effective_max_delay_steps = min(max_delay_steps, int(server_max_delay))
+            logger.info(
+                "RTC delay bound: client=%d server=%d effective=%d",
+                max_delay_steps,
+                server_max_delay,
+                effective_max_delay_steps,
+            )
+        server_horizon = policy.server_metadata.get("action_horizon")
+        if server_horizon is not None:
+            if isinstance(server_horizon, bool) or not isinstance(server_horizon, int) or server_horizon < reinfer + 1:
+                policy.close()
+                debug_close()
+                parser.error(
+                    f"policy server action_horizon must be an integer >= reinfer + 1 ({reinfer + 1})"
+                )
     robot: Any
     cameras: Any = None
     if args.smoke:
@@ -775,7 +850,9 @@ def main() -> None:
         reinfer=reinfer,
         blend=blend,
         inference_delay_steps=inference_delay_steps,
-        rtc_enabled=rtc_enabled,
+        max_delay_steps=effective_max_delay_steps,
+        rtc_enabled=scheduler_enabled,
+        ttrtc_enabled=ttrtc_enabled,
         action_space=action_space,
         image_size=int(_cfg(config, "control", "image_size", default=224)),
         flip_wrist_image=bool(_cfg(config, "cameras", "wrist", "horizontal_flip", default=False)),

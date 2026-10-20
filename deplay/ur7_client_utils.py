@@ -250,8 +250,19 @@ class AbsoluteChunkPolicy:
         self._policy = policy
         self._action_space = action_space
 
-    def infer_chunk(self, observation: Mapping[str, Any]) -> np.ndarray:
-        chunk = np.asarray(self._policy.infer_chunk(observation), dtype=np.float64)
+    def infer_chunk(
+        self,
+        observation: Mapping[str, Any],
+        *,
+        rtc_context: Mapping[str, Any] | None = None,
+    ) -> np.ndarray:
+        if rtc_context is None:
+            chunk = np.asarray(self._policy.infer_chunk(observation), dtype=np.float64)
+        else:
+            chunk = np.asarray(
+                self._policy.infer_chunk(observation, rtc_context=rtc_context),
+                dtype=np.float64,
+            )
         if self._action_space == "relative_se3":
             chunk = relative_to_absolute(chunk, np.asarray(observation["state"][:9]))
         return chunk

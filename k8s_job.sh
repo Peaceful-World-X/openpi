@@ -33,7 +33,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/init_cfg.sh"
   echo "OPENPI_GPU_NUM must be a positive integer" >&2; exit 1;
 }
 for count in 2 4 8; do
-  if [[ "${OPENPI_TRAIN_CONFIG:?}" == *"_80G_${count}gpu_full" && "${OPENPI_GPU_NUM}" != "${count}" ]]; then
+  if [[ "${OPENPI_TRAIN_CONFIG:?}" == *"_80G_${count}gpu_full"* && "${OPENPI_GPU_NUM}" != "${count}" ]]; then
     echo "${OPENPI_TRAIN_CONFIG} requires ${count} GPUs; OPENPI_GPU_NUM=${OPENPI_GPU_NUM}" >&2
     exit 1
   fi
@@ -74,9 +74,14 @@ UPLOADED_DIR="${OPENPI_UPLOAD_MARKERS_DIR:-/tmp/openpi-uploaded-checkpoints}/${C
 mkdir -p "${CHECKPOINT_DIR}/${CONFIG_NAME}" "${UPLOADED_DIR}"
 
 sync_training_log() {
-  [[ -f "${TRAIN_LOG}" ]] || return 0
+  # 训练进程和 tee 退出后上传完整文件，不按 OSS 时间戳跳过最终版本。
+  [[ -f "${TRAIN_LOG}" ]] || {
+    echo "Training log missing; cannot upload ${OSS_RUN_URI}/train.log: ${TRAIN_LOG}" >&2
+    return 1
+  }
   echo "Uploading training log to ${OSS_RUN_URI}/train.log"
-  ossutil_upload cp "${TRAIN_LOG}" "${OSS_RUN_URI}/train.log" --update
+  ossutil_upload cp "${TRAIN_LOG}" "${OSS_RUN_URI}/train.log" -f || return $?
+  echo "Training log saved: ${OSS_RUN_URI}/train.log"
 }
 
 sync_completed_checkpoints() {
@@ -94,9 +99,6 @@ sync_completed_checkpoints() {
     echo "Uploading completed checkpoint ${step} to ${OSS_RUN_URI}/${step}/"
     ossutil_upload cp -r "${checkpoint_path}/" "${OSS_RUN_URI}/${step}/" -j 4 --update || return $?
     printf '%s\n' "${OSS_RUN_URI}/${step}/" >"${marker}" || return $?
-    # Keep the loss/metric log beside the uploaded checkpoints so it can be
-    # plotted while training is still running.
-    sync_training_log || return $?
   done
 }
 
@@ -109,9 +111,6 @@ upload_loop() {
   while true; do
     if ! sync_completed_checkpoints; then
       echo "Checkpoint upload failed; retrying in ${UPLOAD_INTERVAL_SECONDS}s" >&2
-    fi
-    if ! sync_training_log; then
-      echo "Training log upload failed; retrying in ${UPLOAD_INTERVAL_SECONDS}s" >&2
     fi
     sleep "${UPLOAD_INTERVAL_SECONDS}" &
     sleep_pid=$!
@@ -128,13 +127,6 @@ stop_uploader() {
   fi
   uploader_pid=""
 }
-sync_results() {
-  local status=0
-  sync_completed_checkpoints || status=$?
-  sync_training_log || status=$?
-  return "${status}"
-}
-
 training_pid=""
 stop_training() {
   if [[ -n "${training_pid}" ]]; then
@@ -151,8 +143,10 @@ cleanup() {
   trap - EXIT
   trap '' INT TERM
   stop_training
+  # 优先保存含 loss/stderr 的完整日志，不依赖大 checkpoint 上传完成。
+  sync_training_log || upload_status=$?
   stop_uploader
-  sync_results || upload_status=$?
+  sync_completed_checkpoints || upload_status=$?
   if (( exit_status != 0 )); then
     echo "Training/job failed (${exit_status}); final OSS sync status: ${upload_status}" >&2
   elif (( upload_status != 0 )); then
@@ -170,6 +164,7 @@ trap 'exit 130' INT
 echo "config=${CONFIG_NAME}"
 echo "checkpoints=${RUN_DIR}"
 echo "oss=${OSS_RUN_URI}"
+echo "training_log=${TRAIN_LOG} -> ${OSS_RUN_URI}/train.log (uploaded on exit)"
 upload_loop &
 uploader_pid=$!
 

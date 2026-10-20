@@ -135,7 +135,7 @@ def submit_job(args: argparse.Namespace) -> None:
         raise ValueError("OPENPI_GPU_NUM must be a positive integer")
     config_name = getattr(args, "config_name", None) or profile.config_name
     for count in (2, 4, 8):
-        if config_name.endswith(f"_80G_{count}gpu_full") and profile.gpu_num != count:
+        if config_name.removesuffix("_ttrtc").endswith(f"_80G_{count}gpu_full") and profile.gpu_num != count:
             raise ValueError(f"Config {config_name} requires {count} GPUs, requested {profile.gpu_num}")
     gpu_name = getattr(profile.gpu_type, "value", profile.gpu_type)
     if os.environ.get("OPENPI_RESUME") == "1" and not args.exp_name:
